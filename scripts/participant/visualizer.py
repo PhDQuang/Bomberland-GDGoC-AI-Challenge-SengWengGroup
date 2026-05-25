@@ -16,11 +16,33 @@ if str(parent_dir) not in sys.path:
 
 from engine import BomberEnv
 from agent import RandomAgent, SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
-from training import encode_obs, DQNAgent, DQfDAgent
-from training.SQIL import encode_obs as sqil_encode_obs
-from training.bc_ppo_lstm import BC_PPO_LSTM_Agent, is_bc_ppo_lstm_checkpoint
-from training.bc_ppo_lstm_attn_selfplay import ActorCriticAttnLSTM
 from competition.evaluation.runtime_guard import load_agent_instance
+
+try:
+	from agent.dqn_agent.agent import encode_obs, TrainingAgent as DQNAgent
+except Exception:
+	encode_obs = None
+	DQNAgent = None
+
+DQfDAgent = None
+
+try:
+	from training.SQIL import encode_obs as sqil_encode_obs
+except Exception:
+	sqil_encode_obs = None
+
+try:
+	from training.bc_ppo_lstm import BC_PPO_LSTM_Agent, is_bc_ppo_lstm_checkpoint
+except Exception:
+	BC_PPO_LSTM_Agent = None
+
+	def is_bc_ppo_lstm_checkpoint(_ckpt):
+		return False
+
+try:
+	from training.bc_ppo_lstm_attn_selfplay import ActorCriticAttnLSTM
+except Exception:
+	ActorCriticAttnLSTM = None
 
 class Viewer:
 	PLAYER_COLORS = [(220, 50, 50), (50, 50, 220), (30, 150, 30), (200, 140, 0)]
