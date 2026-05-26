@@ -1,0 +1,11 @@
+# Agent này không sử dụng bất kỳ thư viện bên ngoài (external libraries) nào.
+# Toàn bộ thuật toán (A*, BFS, dự đoán nổ) đều sử dụng các thư viện chuẩn (built-in) của Python:
+# - random
+# - sys
+# - pathlib
+# - heapq (dùng cho A*)
+# - collections (dùng cho deque/BFS)
+# - copy
+
+# DO ĐÓ: Bạn KHÔNG CẦN cài thêm bất kỳ package nào qua lệnh pip để chạy agent này!
+# Nó chạy độc lập và cực kỳ tối ưu.
