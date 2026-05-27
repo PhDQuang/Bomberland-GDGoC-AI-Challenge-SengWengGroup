@@ -1,793 +1,1180 @@
-import random
-import sys
-import time
-from pathlib import Path
-import heapq
 from collections import deque
-import copy
-import itertools
-
-MOVES = {
-    0: (0, 0),
-    1: (-1, 0),
-    2: (1, 0),
-    3: (0, -1),
-    4: (0, 1),
-}
-
-# ---------------------------------------------------------
-# 1. Movement / Map
-# ---------------------------------------------------------
-
-def _next_pos(pos, action):
-    dx, dy = MOVES.get(action, (0, 0))
-    return pos[0] + dx, pos[1] + dy
-
-def _in_bounds(grid, x, y):
-    return 0 <= x < grid.shape[0] and 0 <= y < grid.shape[1]
-
-def _passable(grid, x, y):
-    # 0: grass, 3: item range, 4: item capacity
-    return _in_bounds(grid, x, y) and grid[x, y] in [0, 3, 4]
-
-def _valid_actions(grid, pos, blocked_set):
-    actions = [0]
-    for a in [1, 2, 3, 4]:
-        nx, ny = _next_pos(pos, a)
-        if _passable(grid, nx, ny) and (nx, ny) not in blocked_set:
-            actions.append(a)
-    return actions
-
-# ---------------------------------------------------------
-# 2. BFS / Pathfinding (A*)
-# ---------------------------------------------------------
-
-def heuristic_dist(pos1, pos2):
-    return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
-
-def _shortest_path_length(grid, start, target, blocked_set):
-    if start == target:
-        return 0
-        
-    pq = []
-    heapq.heappush(pq, (0, 0, start))
-    seen = {start: 0}
-    
-    while pq:
-        f, g, pos = heapq.heappop(pq)
-        
-        if pos == target:
-            return g
-            
-        if g > seen.get(pos, float('inf')):
-            continue
-            
-        for a in [1, 2, 3, 4]:
-            nx, ny = _next_pos(pos, a)
-            npos = (nx, ny)
-            if _passable(grid, nx, ny) and npos not in blocked_set:
-                new_g = g + 1
-                if new_g < seen.get(npos, float('inf')):
-                    seen[npos] = new_g
-                    f_val = new_g + heuristic_dist(npos, target)
-                    heapq.heappush(pq, (f_val, new_g, npos))
-    return float('inf')
-
-def _astar_to_targets(grid, start, targets, blocked_set, danger_tiles):
-    if start in targets:
-        return 0
-    if not targets:
-        return None
-        
-    pq = [(0, 0, start[0], start[1], None)]
-    seen = {start: 0}
-    
-    while pq:
-        f_val, g, x, y, first_action = heapq.heappop(pq)
-        pos = (x, y)
-        
-        if pos in targets and first_action is not None:
-            return first_action
-            
-        if g > seen.get(pos, float('inf')):
-            continue
-            
-        for a in [1, 2, 3, 4]:
-            nx, ny = _next_pos(pos, a)
-            npos = (nx, ny)
-            if not _passable(grid, nx, ny): continue
-            if npos in blocked_set: continue
-            if npos in danger_tiles: continue
-                
-            new_g = g + 1
-            if new_g < seen.get(npos, float('inf')):
-                seen[npos] = new_g
-                h = min(abs(nx - tx) + abs(ny - ty) for tx, ty in targets)
-                heapq.heappush(pq, (new_g + h, new_g, nx, ny, a if first_action is None else first_action))
-                
-    return None
-
-# ---------------------------------------------------------
-# 3. Bomb / Explosion / Chain Reaction
-# ---------------------------------------------------------
-
-def _blast_tiles(grid, bx, by, radius):
-    tiles = {(bx, by)}
-    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        for r in range(1, radius + 1):
-            x, y = bx + dx * r, by + dy * r
-            if not _in_bounds(grid, x, y):
-                break
-            cell = grid[x, y]
-            if cell == 1:
-                break
-            tiles.add((x, y))
-            if cell == 2:
-                break
-    return tiles
-
-def _chain_bomb_prediction(grid, bombs, players, default_radius=2):
-    bomb_dict = {}
-    for b in bombs:
-        pos = (int(b[0]), int(b[1]))
-        timer = int(b[2])
-        owner_id = int(b[3]) if len(b) > 3 else -1
-        
-        radius = default_radius
-        if 0 <= owner_id < len(players):
-            radius = max(1, int(players[owner_id][4]) + 1)
-            
-        bomb_dict[pos] = {'timer': timer, 'radius': radius}
-        
-    changed = True
-    while changed:
-        changed = False
-        for b_pos, b_info in bomb_dict.items():
-            blast = _blast_tiles(grid, b_pos[0], b_pos[1], b_info['radius'])
-            for other_pos in blast:
-                if other_pos in bomb_dict and other_pos != b_pos:
-                    if bomb_dict[other_pos]['timer'] > b_info['timer']:
-                        bomb_dict[other_pos]['timer'] = b_info['timer']
-                        changed = True
-    return bomb_dict
-
-def _danger_tiles(grid, bombs, players):
-    bomb_timers = _chain_bomb_prediction(grid, bombs, players)
-    
-    danger_soon = set()
-    danger_now = set()
-    
-    for b_pos, b_info in bomb_timers.items():
-        if b_info['timer'] <= 0:
-            continue
-        blast = _blast_tiles(grid, b_pos[0], b_pos[1], b_info['radius'])
-        danger_soon |= blast
-        if b_info['timer'] <= 1:
-            danger_now |= blast
-            
-    return danger_soon, danger_now
-
-def _build_danger_timeline(grid, bombs, players):
-    bomb_timers = _chain_bomb_prediction(grid, bombs, players)
-    danger_timeline = {}
-    for b_pos, b_info in bomb_timers.items():
-        t = b_info['timer']
-        if t <= 0: continue
-        blast = _blast_tiles(grid, b_pos[0], b_pos[1], b_info['radius'])
-        for p in blast:
-            if p not in danger_timeline:
-                danger_timeline[p] = set()
-            danger_timeline[p].add(t)
-            danger_timeline[p].add(t + 1)
-            danger_timeline[p].add(t + 2)
-    return danger_timeline
-
-# ---------------------------------------------------------
-# 4. Survival & Anti-Suicide
-# ---------------------------------------------------------
-
-def _move_to_safe(grid, start, blocked_set, danger_tiles):
-    if start not in danger_tiles and start not in blocked_set:
-        return 0
-        
-    q = deque([(start, None)])
-    seen = {start}
-    
-    while q:
-        pos, first_action = q.popleft()
-        
-        if pos not in danger_tiles and pos not in blocked_set and first_action is not None:
-            return first_action
-            
-        for a in [1, 2, 3, 4]:
-            nx, ny = _next_pos(pos, a)
-            npos = (nx, ny)
-            if npos in seen:
-                continue
-            if not _passable(grid, nx, ny):
-                continue
-            if npos in blocked_set:
-                continue
-                
-            seen.add(npos)
-            q.append((npos, a if first_action is None else first_action))
-            
-    return None
-
-def _spacetime_move_to_safe(grid, start, blocked_set, danger_timeline):
-    pq = [(0, start[0], start[1], None)]
-    seen = {(start[0], start[1], 0)}
-    
-    while pq:
-        t, x, y, first_action = heapq.heappop(pq)
-        pos = (x, y)
-        
-        is_safe_forever = True
-        if pos in danger_timeline:
-            if any(dt >= t for dt in danger_timeline[pos]):
-                is_safe_forever = False
-                
-        if is_safe_forever and first_action is not None and pos not in blocked_set:
-            return first_action
-            
-        if t > 25: 
-            continue
-            
-        for a in [0, 1, 2, 3, 4]:
-            nx, ny = _next_pos(pos, a)
-            npos = (nx, ny)
-            nt = t + 1
-            if not _passable(grid, nx, ny): continue
-            if npos in blocked_set and npos != start: continue
-            if npos in danger_timeline and nt in danger_timeline[npos]: continue
-                
-            state = (nx, ny, nt)
-            if state not in seen:
-                seen.add(state)
-                heapq.heappush(pq, (nt, nx, ny, a if first_action is None else first_action))
-    return None
-
-def _can_escape_after_placing(grid, my_pos, blocked_set, existing_danger, bomb_radius):
-    my_blast = _blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
-    combined_danger = set(existing_danger) | my_blast
-    
-    temp_blocked = set(blocked_set) | {my_pos}
-    
-    q = deque([(my_pos, 0)])
-    seen = {my_pos}
-    
-    while q:
-        pos, dist = q.popleft()
-        
-        if pos not in combined_danger:
-            return True
-            
-        if dist > 8: 
-            continue
-            
-        for a in [1, 2, 3, 4]:
-            nx, ny = _next_pos(pos, a)
-            npos = (nx, ny)
-            if not _passable(grid, nx, ny):
-                continue
-            if npos in temp_blocked:
-                continue
-            if npos in seen:
-                continue
-                
-            seen.add(npos)
-            q.append((npos, dist + 1))
-            
-    return False
-
-# ---------------------------------------------------------
-# 5. Territory & Space Analysis
-# ---------------------------------------------------------
-
-def _escape_space_score(grid, start, blocked_set, max_depth=10):
-    q = deque([(start, 0)])
-    seen = {start}
-    space = 0
-    
-    while q:
-        pos, d = q.popleft()
-        space += 1
-        
-        if d >= max_depth:
-            continue
-            
-        for a in [1, 2, 3, 4]:
-            nx, ny = _next_pos(pos, a)
-            npos = (nx, ny)
-            if not _passable(grid, nx, ny) or npos in blocked_set or npos in seen:
-                continue
-            seen.add(npos)
-            q.append((npos, d + 1))
-            
-    return space
-
-def _is_dead_end(grid, start, blocked_set):
-    return _escape_space_score(grid, start, blocked_set, max_depth=6) <= 4
-
-def _territory_score(grid, my_pos, enemies, blocked_set):
-    q = deque()
-    q.append((my_pos, 0, 0))
-    for e in enemies:
-        q.append((e, 1, 0))
-    owner = {}
-    while q:
-        pos, o_id, dist = q.popleft()
-        if pos in owner: continue
-        owner[pos] = (o_id, dist)
-        for a in [1, 2, 3, 4]:
-            nx, ny = _next_pos(pos, a)
-            npos = (nx, ny)
-            if _passable(grid, nx, ny) and npos not in blocked_set:
-                if npos not in owner:
-                    q.append((npos, o_id, dist + 1))
-    return sum(1 for v in owner.values() if v[0] == 0)
-
-# ---------------------------------------------------------
-# 6. Farming & Item Logic
-# ---------------------------------------------------------
-
-def _count_boxes_in_blast(grid, bx, by, radius):
-    blast = _blast_tiles(grid, bx, by, radius)
-    return sum(1 for x, y in blast if grid[x, y] == 2)
-
-def _box_bomb_spots(grid, blocked_set):
-    spots = set()
-    for x in range(grid.shape[0]):
-        for y in range(grid.shape[1]):
-            if grid[x, y] == 2:
-                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nx, ny = x + dx, y + dy
-                    if _passable(grid, nx, ny) and (nx, ny) not in blocked_set:
-                        spots.add((nx, ny))
-    return spots
-
-def _item_tiles(grid, prefer_capacity=False, prefer_radius=False):
-    preferred = set()
-    if prefer_radius: preferred.add(3)
-    if prefer_capacity: preferred.add(4)
-    
-    preferred_tiles = {(x, y) for x in range(grid.shape[0]) for y in range(grid.shape[1]) if grid[x, y] in preferred}
-    if preferred_tiles: return preferred_tiles
-    
-    return {(x, y) for x in range(grid.shape[0]) for y in range(grid.shape[1]) if grid[x, y] in [3, 4]}
-
-# ---------------------------------------------------------
-# 7. Enemy Logic
-# ---------------------------------------------------------
-
-def _enemy_trapped_score(grid, enemy_pos, blocked_set):
-    return _escape_space_score(grid, enemy_pos, blocked_set, max_depth=5)
-
-# ---------------------------------------------------------
-# 8. MINIMAX (Paranoid 1v2) Fast Simulator
-# ---------------------------------------------------------
-
-def _evaluate_cascade_trap(grid, bombs, enemies):
-    if not bombs or not enemies: return 0
-    
-    true_timers = {b_pos: b_info['timer'] for b_pos, b_info in bombs.items()}
-    changed = True
-    while changed:
-        changed = False
-        for b1, info1 in bombs.items():
-            t1 = true_timers[b1]
-            blast1 = _blast_tiles(grid, b1[0], b1[1], info1['radius'])
-            for b2, info2 in bombs.items():
-                if b1 != b2 and b2 in blast1:
-                    if true_timers[b2] > t1:
-                        true_timers[b2] = t1
-                        changed = True
-                        
-    score = 0
-    for b_pos, info in bombs.items():
-        t = true_timers[b_pos]
-        if t <= 5: # Fast explosion
-            blast = _blast_tiles(grid, b_pos[0], b_pos[1], info['radius'])
-            for e_pos in enemies:
-                if e_pos in blast:
-                    score += 5000 * (6 - t)
-    return score
-
-def _evaluate_state(grid, my_pos, my_alive, enemies, bombs, blocked_set):
-    if not my_alive:
-        return -999999
-    score = 0
-    score -= len(enemies) * 10000 
-    
-    e_space = _escape_space_score(grid, my_pos, blocked_set, max_depth=6)
-    score += e_space * 10
-    
-    center = (grid.shape[0]//2, grid.shape[1]//2)
-    my_dist_to_center = heuristic_dist(my_pos, center)
-    score -= my_dist_to_center * 0.5 # Soft center control
-    
-    for e_pos in enemies:
-        trap_score = _enemy_trapped_score(grid, e_pos, blocked_set)
-        if trap_score <= 4:
-            score += (10 - trap_score) * 100
-            
-    cascade_score = _evaluate_cascade_trap(grid, bombs, enemies)
-    score += cascade_score
-            
-    return score
-
-def _fast_simulate_step(grid, my_pos, my_action, enemies, enemy_actions, bombs, my_bomb_radius):
-    new_bombs = {}
-    for b_pos, b_info in bombs.items():
-        t = b_info['timer'] - 1
-        new_bombs[b_pos] = {'timer': t, 'radius': b_info['radius']}
-        
-    new_my_pos = my_pos
-    if my_action == 5:
-        if my_pos not in new_bombs:
-            new_bombs[my_pos] = {'timer': 40, 'radius': my_bomb_radius}
-    elif my_action != 0:
-        nx, ny = _next_pos(my_pos, my_action)
-        if _passable(grid, nx, ny):
-            new_my_pos = (nx, ny)
-            
-    new_enemies = []
-    for i, e_pos in enumerate(enemies):
-        try:
-            e_action = enemy_actions[i]
-        except IndexError:
-            print(f"CRASH: len(enemies)={len(enemies)}, len(enemy_actions)={len(enemy_actions)}")
-            print(f"enemies={enemies}")
-            print(f"enemy_actions={enemy_actions}")
-            e_action = 0
-        n_epos = e_pos
-        if e_action == 5:
-            if e_pos not in new_bombs:
-                new_bombs[e_pos] = {'timer': 40, 'radius': 2}
-        elif e_action != 0:
-            nx, ny = _next_pos(e_pos, e_action)
-            if _passable(grid, nx, ny):
-                n_epos = (nx, ny)
-        new_enemies.append(n_epos)
-        
-    changed = True
-    while changed:
-        changed = False
-        for b_pos, b_info in list(new_bombs.items()):
-            if b_info['timer'] <= 0:
-                blast = _blast_tiles(grid, b_pos[0], b_pos[1], b_info['radius'])
-                for other_pos in blast:
-                    if other_pos in new_bombs and other_pos != b_pos:
-                        if new_bombs[other_pos]['timer'] > 0:
-                            new_bombs[other_pos]['timer'] = 0
-                            changed = True
-                            
-    my_alive = True
-    for b_pos, b_info in new_bombs.items():
-        if b_info['timer'] <= 0:
-            blast = _blast_tiles(grid, b_pos[0], b_pos[1], b_info['radius'])
-            if new_my_pos in blast:
-                my_alive = False
-            new_enemies = [e for e in new_enemies if e not in blast]
-            
-    new_bombs = {k: v for k, v in new_bombs.items() if v['timer'] > 0}
-    return new_my_pos, my_alive, new_enemies, new_bombs
-
-def _get_enemy_joint_actions(grid, enemies, bombs, my_pos, top_k=None):
-    e_actions = []
-    for e_pos in enemies:
-        acts = [0]
-        for a in [1, 2, 3, 4]:
-            nx, ny = _next_pos(e_pos, a)
-            if _passable(grid, nx, ny):
-                acts.append(a)
-        # CHỈ cho phép địch thả bom nếu địch ở đủ gần ta (để tránh nổ Branching Factor)
-        if heuristic_dist(e_pos, my_pos) <= 3:
-            acts.append(5)
-        e_actions.append(acts)
-    return list(itertools.product(*e_actions))
-
-def _minimax(grid, my_pos, my_alive, enemies, bombs, my_bomb_radius, depth, start_time, time_limit, blocked_set, tt, alpha=-float('inf'), beta=float('inf')):
-    if not my_alive:
-        return -999999, None
-        
-    state_key = (my_pos, tuple(sorted(enemies)), tuple(sorted((k, v['timer'], v['radius']) for k, v in bombs.items())), depth)
-    if state_key in tt:
-        entry = tt[state_key]
-        if entry['type'] == 'EXACT': return entry['value'], entry['action']
-        if entry['type'] == 'LOWER' and entry['value'] >= beta: return entry['value'], entry['action']
-        if entry['type'] == 'UPPER' and entry['value'] <= alpha: return entry['value'], entry['action']
-        
-    if depth == 0 or not enemies or (time.perf_counter() - start_time) > time_limit:
-        blocked = set(enemies) | set(bombs.keys()) | blocked_set
-        val = _evaluate_state(grid, my_pos, my_alive, enemies, bombs, blocked)
-        tt[state_key] = {'value': val, 'action': None, 'type': 'EXACT'}
-        return val, None
-        
-    best_action = None
-    max_score = -float('inf')
-    alpha_orig = alpha
-    
-    # MOVE ORDERING
-    my_valid = []
-    dist_to_closest = min([heuristic_dist(my_pos, e) for e in enemies]) if enemies else 99
-    if dist_to_closest <= 2:
-        my_valid.append(5)
-        
-    moves = []
-    for a in [1, 2, 3, 4]:
-        nx, ny = _next_pos(my_pos, a)
-        if _passable(grid, nx, ny):
-            moves.append((a, min([heuristic_dist((nx, ny), e) for e in enemies]) if enemies else 0))
-    moves.sort(key=lambda x: x[1])
-    my_valid.extend([x[0] for x in moves])
-    
-    my_valid.append(0)
-    
-    if dist_to_closest > 2:
-        my_valid.append(5)
-        
-    joint_enemy_actions = _get_enemy_joint_actions(grid, enemies, bombs, my_pos)
-    
-    for a in my_valid:
-        min_score = float('inf')
-        for e_actions in joint_enemy_actions:
-            n_my_pos, n_my_alive, n_enemies, n_bombs = _fast_simulate_step(
-                grid, my_pos, a, enemies, e_actions, bombs, my_bomb_radius
-            )
-            score, _ = _minimax(grid, n_my_pos, n_my_alive, n_enemies, n_bombs, my_bomb_radius, depth - 1, start_time, time_limit, blocked_set, tt, alpha, min(beta, min_score))
-            
-            if score < min_score:
-                min_score = score
-            if time.perf_counter() - start_time > time_limit:
-                break
-                
-            if min_score <= alpha:
-                break # Cắt tỉa Alpha
-                
-        if min_score > max_score:
-            max_score = min_score
-            best_action = a
-            
-        if time.perf_counter() - start_time > time_limit:
-            break
-            
-        if max_score >= beta:
-            break # Cắt tỉa Beta
-        if max_score > alpha:
-            alpha = max_score
-            
-    if time.perf_counter() - start_time <= time_limit:
-        flag = 'EXACT'
-        if max_score <= alpha_orig:
-            flag = 'UPPER'
-        elif max_score >= beta:
-            flag = 'LOWER'
-        tt[state_key] = {'value': max_score, 'action': best_action, 'type': flag}
-            
-    return max_score, best_action
+import time
 
 
-# =========================================================
-# BOT LÕI
-# =========================================================
 class Agent:
-    team_id = "AdvancedHeuristicBot_V2"
-    
+    team_id = "AdvancedHeuristicBot_V3"
+    team_id = "TemporalAggressiveEndgameV1"
+
+    GRASS = 0
+    WALL = 1
+    BOX = 2
+    ITEM_RADIUS = 3
+    ITEM_CAPACITY = 4
+
+    STOP = 0
+    LEFT = 1
+    RIGHT = 2
+    UP = 3
+    DOWN = 4
+    BOMB = 5
+
+    MOVES = {
+        STOP: (0, 0),
+        LEFT: (-1, 0),
+        RIGHT: (1, 0),
+        UP: (0, -1),
+        DOWN: (0, 1),
+    }
+    DIRS = [LEFT, RIGHT, UP, DOWN]
+    SEARCH_ACTIONS = [LEFT, RIGHT, UP, DOWN, STOP]
+    MAX_RADIUS = 5
+    MAX_CAPACITY = 5
+    HORIZON = 15
+
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
+        self.bomb_radii = {}
+        self.last_bonuses = None
+        self.turn = 0
+        self.escape_mode = False
+        self.last_action = 0
 
     def act(self, obs: dict) -> int:
-        import traceback
+        started = time.perf_counter()
         try:
-            return self._act_internal(obs)
-        except Exception as e:
-            traceback.print_exc()
-            return 0
-            
-    def _act_internal(self, obs: dict) -> int:
+            if self._looks_like_new_game(obs):
+                self._reset_state()
+
+            self.turn += 1
+            grid = obs["map"]
+            players = obs["players"]
+            if self.agent_id >= len(players) or int(players[self.agent_id][2]) != 1:
+                self._remember_player_bonuses(players)
+                return 0
+
+            self._update_bomb_memory(obs)
+            ctx = self._build_context(obs)
+            action = self._decide(ctx, started)
+
+            if action not in (0, 1, 2, 3, 4, 5):
+                action = self._fallback_action(ctx)
+            self.last_action = int(action)
+            self._remember_player_bonuses(players)
+            return int(action)
+        except Exception:
+            return int(self._emergency_action(obs))
+
+    # ------------------------------------------------------------------
+    # State and observation parsing
+    # ------------------------------------------------------------------
+
+    def _reset_state(self):
+        self.bomb_radii.clear()
+        self.last_bonuses = None
+        self.turn = 0
+        self.escape_mode = False
+        self.last_action = 0
+
+    def _looks_like_new_game(self, obs):
+        if self.turn == 0:
+            return False
+        bombs = obs.get("bombs", [])
+        try:
+            if len(bombs) != 0:
+                return False
+        except TypeError:
+            return False
+        players = obs.get("players")
+        grid = obs.get("map")
+        if players is None or grid is None or len(players) < 4:
+            return False
+        h, w = grid.shape
+        starts = {(1, 1), (h - 2, w - 2), (1, w - 2), (h - 2, 1)}
+        seen = set()
+        for p in players[:4]:
+            if int(p[2]) != 1:
+                return False
+            seen.add((int(p[0]), int(p[1])))
+        return seen == starts
+
+    def _remember_player_bonuses(self, players):
+        self.last_bonuses = [int(p[4]) for p in players]
+
+    def _update_bomb_memory(self, obs):
+        players = obs["players"]
+        observed = set()
+        for row in obs["bombs"]:
+            bx, by, timer, owner = self._parse_bomb(row)
+            if timer <= 0:
+                continue
+            key = (bx, by, owner)
+            observed.add(key)
+            if key not in self.bomb_radii:
+                if self.last_bonuses is not None and 0 <= owner < len(self.last_bonuses):
+                    bonus = self.last_bonuses[owner]
+                elif 0 <= owner < len(players):
+                    bonus = int(players[owner][4])
+                else:
+                    bonus = 0
+                self.bomb_radii[key] = self._clamp_radius(1 + bonus)
+
+        for key in list(self.bomb_radii):
+            if key not in observed:
+                del self.bomb_radii[key]
+
+    def _build_context(self, obs):
         grid = obs["map"]
         players = obs["players"]
-        bombs = obs["bombs"]
+        my = players[self.agent_id]
+        my_pos = (int(my[0]), int(my[1]))
+        my_bombs_left = int(my[3])
+        my_radius = self._clamp_radius(1 + int(my[4]))
 
-        if self.agent_id >= len(players) or players[self.agent_id][2] != 1:
+        enemies = []
+        enemy_set = set()
+        for i, p in enumerate(players):
+            if i == self.agent_id or int(p[2]) != 1:
+                continue
+            pos = (int(p[0]), int(p[1]))
+            enemies.append(
+                {
+                    "id": i,
+                    "pos": pos,
+                    "bombs_left": int(p[3]),
+                    "radius": self._clamp_radius(1 + int(p[4])),
+                }
+            )
+            enemy_set.add(pos)
+
+        bombs = []
+        bomb_positions = set()
+        for row in obs["bombs"]:
+            bx, by, timer, owner = self._parse_bomb(row)
+            if timer <= 0:
+                continue
+            key = (bx, by, owner)
+            radius = self.bomb_radii.get(key)
+            if radius is None:
+                if 0 <= owner < len(players):
+                    radius = self._clamp_radius(1 + int(players[owner][4]))
+                else:
+                    radius = 2
+            bomb = {
+                "pos": (bx, by),
+                "timer": max(1, int(timer)),
+                "owner": owner,
+                "radius": self._clamp_radius(radius),
+                "hypothetical": False,
+            }
+            bombs.append(bomb)
+            bomb_positions.add((bx, by))
+
+        schedule = self._compute_schedule(grid, bombs)
+        enemy_risk = self._enemy_potential_blasts(grid, enemies, bomb_positions)
+        alive_count = 1 + len(enemies)
+        phase = "end" if alive_count <= 2 else ("mid" if alive_count == 3 else "early")
+
+        ctx = {
+            "grid": grid,
+            "players": players,
+            "my_pos": my_pos,
+            "my_bombs_left": my_bombs_left,
+            "my_radius": my_radius,
+            "my_bonus": int(my[4]),
+            "enemies": enemies,
+            "enemy_set": enemy_set,
+            "bombs": schedule["bombs"],
+            "bomb_positions": bomb_positions,
+            "danger_at": schedule["danger_at"],
+            "earliest": schedule["earliest"],
+            "enemy_risk": enemy_risk,
+            "alive_count": alive_count,
+            "phase": phase,
+            "valid_actions": None,
+        }
+        ctx["valid_actions"] = self._valid_actions(ctx)
+        return ctx
+
+    def _parse_bomb(self, row):
+        bx = int(row[0])
+        by = int(row[1])
+        timer = int(row[2]) if len(row) > 2 else 7
+        owner = int(row[3]) if len(row) > 3 else -1
+        return bx, by, timer, owner
+
+    def _clamp_radius(self, radius):
+        return max(1, min(self.MAX_RADIUS, int(radius)))
+
+    # ------------------------------------------------------------------
+    # Decision policy
+    # ------------------------------------------------------------------
+
+    def _decide(self, ctx, started):
+        my_pos = ctx["my_pos"]
+        danger_at = ctx["danger_at"]
+        next_hit = self._next_danger_time(my_pos, 1, danger_at)
+
+        if self.escape_mode and self._is_future_safe(my_pos, 1, danger_at):
+            if self._reachable_count(ctx, my_pos, 0, ctx["bombs"], danger_at, 9) >= 8:
+                self.escape_mode = False
+
+        if next_hit == 1 or (self.escape_mode and next_hit is not None):
+            action = self._best_escape_action(ctx)
+            if action is not None:
+                return action
+            return self._fallback_action(ctx)
+
+        current_bomb = self._score_bomb_at(ctx, my_pos)
+        if current_bomb["legal"] and current_bomb["score"] >= self._bomb_threshold(current_bomb):
+            self.escape_mode = True
+            return self.BOMB
+        if time.perf_counter() - started > 0.08:
+            return self._quick_safe_action(ctx)
+
+        if next_hit is not None and next_hit <= 3:
+            action = self._best_escape_action(ctx)
+            if action is not None:
+                return action
+
+        objective = self._choose_objective(ctx, started)
+        if objective is not None:
+            return objective
+
+        return self._fallback_action(ctx)
+
+    def _bomb_threshold(self, bomb):
+        phase = bomb.get("phase", "mid")
+        safety_tax = 0.0
+        if bomb.get("slack", 7) < 3:
+            safety_tax += 2.0
+        if bomb.get("escape_area", 10) <= 4:
+            safety_tax += 1.0
+        if bomb["enemy_hits"] or bomb["trap_score"] >= 1.5:
+            return (3.6 if phase == "end" else 5.5 if self.turn < 120 else 4.2) + safety_tax
+        if bomb["boxes"] >= 3:
+            return (5.6 if phase == "end" else 5.0) + safety_tax
+        if bomb["boxes"] == 2:
+            return (5.4 if phase == "end" else 4.1) + safety_tax
+        if bomb["boxes"] == 1:
+            return (6.0 if phase == "end" else 3.2 if self.turn < 180 else 3.7) + safety_tax
+        return (4.2 if phase == "end" else 6.0) + safety_tax
+
+    def _choose_objective(self, ctx, started):
+        best = None
+
+        if time.perf_counter() - started > 0.08:
+            return None
+
+        reach = self._temporal_reach_map(ctx, self.HORIZON)
+
+        item_choice = self._best_item_move(ctx, reach)
+        if item_choice is not None:
+            best = item_choice
+
+        if time.perf_counter() - started < 0.075:
+            box_choice = self._best_box_position_move(ctx, reach)
+            if box_choice is not None and (best is None or box_choice[0] > best[0]):
+                best = box_choice
+
+        if time.perf_counter() - started < 0.08:
+            enemy_choice = self._best_enemy_pressure_move(ctx, reach)
+            if enemy_choice is not None and (best is None or enemy_choice[0] > best[0]):
+                best = enemy_choice
+
+        if best is None:
+            return None
+        return best[1]
+
+    # ------------------------------------------------------------------
+    # Bomb scoring and objectives
+    # ------------------------------------------------------------------
+
+    def _score_bomb_at(self, ctx, pos):
+        if ctx["my_bombs_left"] <= 0 or pos in ctx["bomb_positions"]:
+            return self._illegal_bomb_score()
+
+        grid = ctx["grid"]
+        radius = ctx["my_radius"]
+        blast = self._blast_tiles(grid, pos[0], pos[1], radius)
+        boxes = sum(1 for tile in blast if int(grid[tile[0], tile[1]]) == self.BOX)
+        enemy_hits = [enemy for enemy in ctx["enemies"] if enemy["pos"] in blast]
+
+        hypo_bombs, hypo_danger, hypo_earliest = self._hypothetical_schedule(ctx, pos, radius)
+        if self._is_deadly(pos, 1, hypo_danger):
+            return self._illegal_bomb_score()
+
+        escape = self._find_escape(
+            grid,
+            pos,
+            1,
+            hypo_bombs,
+            hypo_danger,
+            horizon=self.HORIZON,
+        )
+        if escape is None:
+            return self._illegal_bomb_score()
+
+        escape_action, escape_time, escape_pos = escape
+        own_det = 7
+        slack = own_det - escape_time
+        escape_area = self._reachable_count(
+            ctx, escape_pos, escape_time, hypo_bombs, hypo_danger, 8
+        )
+
+        trap_score = 0.0
+        for enemy in ctx["enemies"]:
+            epos = enemy["pos"]
+            if epos not in blast:
+                if self._manhattan(pos, epos) <= radius + 1:
+                    trap_score += 0.25
+                continue
+            enemy_escape = self._find_escape(
+                grid,
+                epos,
+                0,
+                hypo_bombs,
+                hypo_danger,
+                horizon=7,
+                ignore_start_bomb=True,
+            )
+            if enemy_escape is None:
+                trap_score += 2.8
+            else:
+                _, etime, e_safe = enemy_escape
+                enemy_area = self._reachable_count(
+                    ctx, e_safe, etime, hypo_bombs, hypo_danger, 5
+                )
+                if enemy_area <= 2:
+                    trap_score += 1.4
+                elif enemy_area <= 5:
+                    trap_score += 0.8
+                else:
+                    trap_score += 0.25
+
+        endgame_trap_bonus = 0.0
+        if ctx["phase"] == "end" and enemy_hits:
+            det_time = self._hypothetical_det_time(hypo_bombs, pos)
+            for enemy in enemy_hits:
+                profile = self._enemy_escape_profile(
+                    ctx, enemy["pos"], hypo_bombs, hypo_danger, min(det_time + 1, 8)
+                )
+                deadness = self._dead_zone_score(ctx, enemy["pos"])
+                if profile["routes"] <= 1:
+                    endgame_trap_bonus += 3.0
+                elif profile["routes"] == 2:
+                    endgame_trap_bonus += 1.0
+                else:
+                    endgame_trap_bonus -= 0.8
+                if profile["area"] <= 3:
+                    endgame_trap_bonus += 2.2
+                elif profile["area"] <= 6:
+                    endgame_trap_bonus += 0.9
+                else:
+                    endgame_trap_bonus -= 0.5
+                endgame_trap_bonus += deadness * 0.8
+
+        item_value = boxes * 0.9
+        multi_bonus = max(0, boxes - 1) * 1.2
+        score = boxes * 3.0 + multi_bonus + item_value
+        score += len(enemy_hits) * 6.5 + trap_score * 3.0
+        score += endgame_trap_bonus
+        if ctx["phase"] == "end" and boxes and not enemy_hits:
+            score -= 2.0
+        score += min(escape_area, 12) * 0.12
+        if slack < 3:
+            score -= (3 - slack) * 1.6
+        if escape_area <= 3:
+            score -= 2.0
+        if pos in ctx["enemy_risk"]:
+            score -= 1.0
+        if boxes == 0 and not enemy_hits and trap_score < 1.0:
+            score -= 4.0
+
+        return {
+            "legal": True,
+            "score": score,
+            "boxes": boxes,
+            "enemy_hits": len(enemy_hits),
+            "trap_score": trap_score,
+            "phase": ctx["phase"],
+            "slack": slack,
+            "escape_area": escape_area,
+            "escape_action": escape_action,
+        }
+
+    def _illegal_bomb_score(self):
+        return {
+            "legal": False,
+            "score": -10**9,
+            "boxes": 0,
+            "enemy_hits": 0,
+            "trap_score": 0.0,
+            "slack": -99,
+            "escape_area": 0,
+            "escape_action": None,
+        }
+
+    def _hypothetical_det_time(self, bombs, pos):
+        best = 7
+        for bomb in bombs:
+            if bomb.get("hypothetical") and bomb["pos"] == pos:
+                best = min(best, int(bomb.get("det_time", bomb.get("timer", 7))))
+        return max(1, best)
+
+    def _enemy_escape_profile(self, ctx, start, bombs, danger_at, horizon):
+        grid = ctx["grid"]
+        q = deque([(start, 0, None)])
+        seen = {(start, 0)}
+        routes = set()
+        safe_positions = set()
+        while q:
+            pos, t, first = q.popleft()
+            if t > 0 and self._is_future_safe(pos, t, danger_at):
+                routes.add(first if first is not None else self.STOP)
+                safe_positions.add(pos)
+            if t >= horizon:
+                continue
+            for action in self.SEARCH_ACTIONS:
+                npos = self._next_pos(pos, action)
+                nt = t + 1
+                if not self._passable(grid, npos[0], npos[1]):
+                    continue
+                if self._bomb_blocks(pos, npos, nt, bombs):
+                    continue
+                if self._is_deadly(npos, nt, danger_at):
+                    continue
+                state = (npos, nt)
+                if state in seen:
+                    continue
+                seen.add(state)
+                q.append((npos, nt, action if first is None else first))
+        return {"routes": len(routes), "area": len(safe_positions)}
+
+    def _dead_zone_score(self, ctx, pos):
+        grid = ctx["grid"]
+        if not self._passable(grid, pos[0], pos[1]):
+            return 0.0
+        exits = 0
+        actions = []
+        for action in self.DIRS:
+            npos = self._next_pos(pos, action)
+            if self._passable(grid, npos[0], npos[1]) and npos not in ctx["bomb_positions"]:
+                exits += 1
+                actions.append(action)
+        if exits <= 1:
+            score = 2.5
+        elif exits == 2:
+            opposite = set(actions) in ({self.LEFT, self.RIGHT}, {self.UP, self.DOWN})
+            score = 0.8 if opposite else 1.35
+        elif exits == 3:
+            score = 0.25
+        else:
+            score = 0.0
+        if self._static_local_area(ctx, pos, 4) <= 6:
+            score += 0.6
+        return score
+
+    def _static_local_area(self, ctx, start, depth):
+        grid = ctx["grid"]
+        q = deque([(start, 0)])
+        seen = {start}
+        while q:
+            pos, d = q.popleft()
+            if d >= depth:
+                continue
+            for action in self.DIRS:
+                npos = self._next_pos(pos, action)
+                if npos in seen or npos in ctx["bomb_positions"]:
+                    continue
+                if not self._passable(grid, npos[0], npos[1]):
+                    continue
+                seen.add(npos)
+                q.append((npos, d + 1))
+        return len(seen)
+
+    def _best_item_move(self, ctx, reach):
+        grid = ctx["grid"]
+        targets = []
+        for x in range(grid.shape[0]):
+            for y in range(grid.shape[1]):
+                cell = int(grid[x, y])
+                if cell not in (self.ITEM_RADIUS, self.ITEM_CAPACITY):
+                    continue
+                value = self._item_value(ctx, cell)
+                if value <= 0:
+                    continue
+                targets.append(((x, y), value))
+
+        best = None
+        for target, value in targets:
+            path = reach.get(target)
+            if path is None:
+                continue
+            dist, action = path
+            score = value - dist * 0.55
+            if target in ctx["enemy_risk"]:
+                score -= 1.2
+            if self._adjacent_enemy(ctx, target):
+                score -= 1.0
+            if best is None or score > best[0]:
+                best = (score, action)
+        return best
+
+    def _item_value(self, ctx, cell):
+        if cell == self.ITEM_CAPACITY:
+            if ctx["my_bombs_left"] <= 1:
+                return 7.0
+            return 4.0
+        if cell == self.ITEM_RADIUS:
+            if ctx["my_bonus"] <= 1:
+                return 6.5
+            if ctx["my_bonus"] < self.MAX_RADIUS - 1:
+                return 3.5
+        return 0.0
+
+    def _best_box_position_move(self, ctx, reach):
+        grid = ctx["grid"]
+        candidates = []
+        for x in range(1, grid.shape[0] - 1):
+            for y in range(1, grid.shape[1] - 1):
+                pos = (x, y)
+                if not self._passable(grid, x, y):
+                    continue
+                if pos in ctx["bomb_positions"]:
+                    continue
+                blast = self._blast_tiles(grid, x, y, ctx["my_radius"])
+                boxes = sum(1 for tx, ty in blast if int(grid[tx, ty]) == self.BOX)
+                if boxes <= 0:
+                    continue
+                open_n = self._open_neighbors(grid, pos, ctx["bomb_positions"])
+                value = boxes * 3.0 + max(0, boxes - 1) * 1.3 + open_n * 0.25
+                candidates.append((value, pos, boxes))
+
+        candidates.sort(reverse=True)
+        best = None
+        for value, pos, boxes in candidates[:24]:
+            path = reach.get(pos)
+            if path is None:
+                continue
+            dist, action = path
+            score = value - dist * 0.42
+            if pos in ctx["enemy_risk"]:
+                score -= 0.8
+            if boxes >= 2:
+                score += 0.6
+            if best is None or score > best[0]:
+                best = (score, action)
+        return best
+
+    def _best_enemy_pressure_move(self, ctx, reach):
+        if ctx["my_bombs_left"] <= 0 or not ctx["enemies"]:
+            return None
+        grid = ctx["grid"]
+        candidates = []
+        for enemy in ctx["enemies"]:
+            epos = enemy["pos"]
+            for x in range(1, grid.shape[0] - 1):
+                for y in range(1, grid.shape[1] - 1):
+                    pos = (x, y)
+                    if pos in ctx["bomb_positions"] or not self._passable(grid, x, y):
+                        continue
+                    if self._line_blast_hits(grid, pos, epos, ctx["my_radius"]):
+                        value = 5.2 - self._manhattan(pos, epos) * 0.12
+                        if ctx["phase"] == "end":
+                            value += self._dead_zone_score(ctx, epos) * 1.1 + 1.8
+                    elif self._manhattan(pos, epos) <= 3:
+                        value = 2.0 - self._manhattan(pos, epos) * 0.25
+                    else:
+                        continue
+                    candidates.append((value, pos))
+
+        candidates.sort(reverse=True)
+        best = None
+        for value, pos in candidates[:20]:
+            path = reach.get(pos)
+            if path is None:
+                continue
+            dist, action = path
+            score = value - dist * 0.35
+            if pos in ctx["enemy_risk"]:
+                score -= 0.9
+            if best is None or score > best[0]:
+                best = (score, action)
+        return best
+
+    # ------------------------------------------------------------------
+    # Safety, escape, and path finding
+    # ------------------------------------------------------------------
+
+    def _best_escape_action(self, ctx):
+        best_action = None
+        best_score = -10**9
+        for action in ctx["valid_actions"]:
+            if action == self.BOMB:
+                continue
+            npos = self._next_pos(ctx["my_pos"], action)
+            if not self._movement_action_legal(ctx, ctx["my_pos"], npos, 1):
+                continue
+            if self._is_deadly(npos, 1, ctx["danger_at"]):
+                continue
+
+            score = 0.0
+            if self._is_future_safe(npos, 1, ctx["danger_at"]):
+                score += 18.0
+            else:
+                escape = self._find_escape(
+                    ctx["grid"], npos, 1, ctx["bombs"], ctx["danger_at"], self.HORIZON
+                )
+                if escape is None:
+                    score -= 30.0
+                else:
+                    _, dist, safe_pos = escape
+                    score += 13.0 - dist * 0.9
+                    score += self._open_neighbors(ctx["grid"], safe_pos, ctx["bomb_positions"]) * 0.6
+
+            score += self._open_neighbors(ctx["grid"], npos, ctx["bomb_positions"]) * 1.3
+            score += min(
+                self._reachable_count(ctx, npos, 1, ctx["bombs"], ctx["danger_at"], 8),
+                16,
+            ) * 0.25
+            if npos in ctx["enemy_risk"]:
+                score -= 1.5
+            if npos in ctx["enemy_set"]:
+                score -= 0.8
+            if action == self.STOP and self._next_danger_time(ctx["my_pos"], 1, ctx["danger_at"]) is not None:
+                score -= 4.0
+
+            if score > best_score:
+                best_score = score
+                best_action = action
+        return best_action
+
+    def _path_to_targets(self, ctx, targets, horizon):
+        grid = ctx["grid"]
+        start = ctx["my_pos"]
+        if start in targets:
+            return (self.STOP, 0, start)
+
+        q = deque([(start, 0, None)])
+        seen = {(start, 0)}
+        while q:
+            pos, t, first = q.popleft()
+            if t >= horizon:
+                continue
+            ordered = self._ordered_actions_toward(pos, targets)
+            for action in ordered:
+                npos = self._next_pos(pos, action)
+                nt = t + 1
+                if not self._passable(grid, npos[0], npos[1]):
+                    continue
+                if self._bomb_blocks(pos, npos, nt, ctx["bombs"]):
+                    continue
+                if self._is_deadly(npos, nt, ctx["danger_at"]):
+                    continue
+                state = (npos, nt)
+                if state in seen:
+                    continue
+                seen.add(state)
+                first_action = action if first is None else first
+                if npos in targets:
+                    return (first_action, nt, npos)
+                q.append((npos, nt, first_action))
+        return None
+
+    def _temporal_reach_map(self, ctx, horizon):
+        grid = ctx["grid"]
+        start = ctx["my_pos"]
+        q = deque([(start, 0, None)])
+        seen = {(start, 0)}
+        reach = {start: (0, self.STOP)}
+
+        while q:
+            pos, t, first = q.popleft()
+            if t >= horizon:
+                continue
+            for action in self.SEARCH_ACTIONS:
+                npos = self._next_pos(pos, action)
+                nt = t + 1
+                if not self._passable(grid, npos[0], npos[1]):
+                    continue
+                if self._bomb_blocks(pos, npos, nt, ctx["bombs"]):
+                    continue
+                if self._is_deadly(npos, nt, ctx["danger_at"]):
+                    continue
+                state = (npos, nt)
+                if state in seen:
+                    continue
+                seen.add(state)
+                first_action = action if first is None else first
+                if npos not in reach or nt < reach[npos][0]:
+                    reach[npos] = (nt, first_action)
+                q.append((npos, nt, first_action))
+        return reach
+
+    def _find_escape(
+        self,
+        grid,
+        start,
+        start_time,
+        bombs,
+        danger_at,
+        horizon,
+        ignore_start_bomb=False,
+    ):
+        q = deque([(start, start_time, None)])
+        seen = {(start, start_time)}
+        while q:
+            pos, t, first = q.popleft()
+            if t > start_time and self._is_future_safe(pos, t, danger_at):
+                return (first if first is not None else self.STOP, t, pos)
+            if t - start_time >= horizon:
+                continue
+
+            for action in self.SEARCH_ACTIONS:
+                npos = self._next_pos(pos, action)
+                nt = t + 1
+                if not self._passable(grid, npos[0], npos[1]):
+                    continue
+                if self._bomb_blocks(pos, npos, nt, bombs):
+                    if not (ignore_start_bomb and npos == start):
+                        continue
+                if self._is_deadly(npos, nt, danger_at):
+                    continue
+                state = (npos, nt)
+                if state in seen:
+                    continue
+                seen.add(state)
+                first_action = action if first is None else first
+                q.append((npos, nt, first_action))
+        return None
+
+    def _reachable_count(self, ctx, start, start_time, bombs, danger_at, horizon):
+        grid = ctx["grid"]
+        q = deque([(start, start_time)])
+        seen = {(start, start_time)}
+        positions = set()
+        while q:
+            pos, t = q.popleft()
+            if self._is_future_safe(pos, t, danger_at):
+                positions.add(pos)
+            if t - start_time >= horizon:
+                continue
+            for action in self.SEARCH_ACTIONS:
+                npos = self._next_pos(pos, action)
+                nt = t + 1
+                if not self._passable(grid, npos[0], npos[1]):
+                    continue
+                if self._bomb_blocks(pos, npos, nt, bombs):
+                    continue
+                if self._is_deadly(npos, nt, danger_at):
+                    continue
+                state = (npos, nt)
+                if state in seen:
+                    continue
+                seen.add(state)
+                q.append((npos, nt))
+        return len(positions)
+
+    def _fallback_action(self, ctx):
+        best = None
+        for action in ctx["valid_actions"]:
+            if action == self.BOMB:
+                continue
+            npos = self._next_pos(ctx["my_pos"], action)
+            if not self._movement_action_legal(ctx, ctx["my_pos"], npos, 1):
+                continue
+            if self._is_deadly(npos, 1, ctx["danger_at"]):
+                continue
+            score = self._open_neighbors(ctx["grid"], npos, ctx["bomb_positions"]) * 1.5
+            score += self._reachable_count(ctx, npos, 1, ctx["bombs"], ctx["danger_at"], 8)
+            future = self._next_danger_time(npos, 1, ctx["danger_at"])
+            if future is None:
+                score += 10
+            else:
+                score += min(future, 7) * 0.4
+            if npos in ctx["enemy_risk"]:
+                score -= 1.0
+            if action == self.STOP:
+                score -= 0.25
+            if best is None or score > best[0]:
+                best = (score, action)
+        return best[1] if best is not None else 0
+
+    def _quick_safe_action(self, ctx):
+        best = None
+        for action in ctx["valid_actions"]:
+            if action == self.BOMB:
+                continue
+            npos = self._next_pos(ctx["my_pos"], action)
+            if not self._movement_action_legal(ctx, ctx["my_pos"], npos, 1):
+                continue
+            if self._is_deadly(npos, 1, ctx["danger_at"]):
+                continue
+            future = self._next_danger_time(npos, 1, ctx["danger_at"])
+            score = self._open_neighbors(ctx["grid"], npos, ctx["bomb_positions"]) * 2.0
+            score += 8.0 if future is None else min(future, 7) * 0.6
+            if npos in ctx["enemy_risk"]:
+                score -= 1.0
+            if action == self.STOP:
+                score -= 0.2
+            if best is None or score > best[0]:
+                best = (score, action)
+        return best[1] if best is not None else 0
+
+    # ------------------------------------------------------------------
+    # Schedule and danger maps
+    # ------------------------------------------------------------------
+
+    def _hypothetical_schedule(self, ctx, pos, radius):
+        bombs = [dict(b) for b in ctx["bombs"]]
+        bombs.append(
+            {
+                "pos": pos,
+                "timer": 7,
+                "owner": self.agent_id,
+                "radius": self._clamp_radius(radius),
+                "hypothetical": True,
+            }
+        )
+        schedule = self._compute_schedule(ctx["grid"], bombs)
+        return schedule["bombs"], schedule["danger_at"], schedule["earliest"]
+
+    def _compute_schedule(self, grid, bombs):
+        bombs = [dict(b) for b in bombs if int(b.get("timer", 0)) > 0]
+        n = len(bombs)
+        if n == 0:
+            return {"bombs": [], "danger_at": {}, "earliest": {}}
+
+        det = [max(1, int(b["timer"])) for b in bombs]
+        processed = [False] * n
+        affected_by_time = {}
+        sim_grid = grid.copy()
+        max_timer = max(max(det), 7)
+
+        for t in range(1, max_timer + 1):
+            exploding = [i for i in range(n) if not processed[i] and det[i] == t]
+            if not exploding:
+                continue
+            affected = set()
+            while exploding:
+                i = exploding.pop()
+                if processed[i]:
+                    continue
+                processed[i] = True
+                bx, by = bombs[i]["pos"]
+                blast = self._blast_tiles(sim_grid, bx, by, bombs[i]["radius"])
+                bombs[i]["blast"] = blast
+                affected |= blast
+                for j in range(n):
+                    if processed[j] or det[j] <= t:
+                        continue
+                    if bombs[j]["pos"] in blast:
+                        det[j] = t
+                        exploding.append(j)
+
+            affected_by_time.setdefault(t, set()).update(affected)
+            for x, y in affected:
+                if int(sim_grid[x, y]) == self.BOX:
+                    sim_grid[x, y] = self.GRASS
+
+        danger_at = {}
+        earliest = {}
+        for t, tiles in affected_by_time.items():
+            for tile in tiles:
+                danger_at.setdefault(tile, set()).add(t)
+                if tile not in earliest or t < earliest[tile]:
+                    earliest[tile] = t
+
+        for i, bomb in enumerate(bombs):
+            bomb["det_time"] = det[i]
+            if "blast" not in bomb:
+                bx, by = bomb["pos"]
+                bomb["blast"] = self._blast_tiles(grid, bx, by, bomb["radius"])
+        return {"bombs": bombs, "danger_at": danger_at, "earliest": earliest}
+
+    def _blast_tiles(self, grid, bx, by, radius):
+        tiles = {(int(bx), int(by))}
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            for r in range(1, int(radius) + 1):
+                x = int(bx) + dx * r
+                y = int(by) + dy * r
+                if not self._in_bounds(grid, x, y):
+                    break
+                cell = int(grid[x, y])
+                if cell == self.WALL:
+                    break
+                tiles.add((x, y))
+                if cell == self.BOX:
+                    break
+        return tiles
+
+    def _enemy_potential_blasts(self, grid, enemies, bomb_positions):
+        risk = set()
+        for enemy in enemies:
+            if enemy["bombs_left"] <= 0 or enemy["pos"] in bomb_positions:
+                continue
+            ex, ey = enemy["pos"]
+            risk |= self._blast_tiles(grid, ex, ey, enemy["radius"])
+        return risk
+
+    # ------------------------------------------------------------------
+    # Movement and danger predicates
+    # ------------------------------------------------------------------
+
+    def _valid_actions(self, ctx):
+        actions = [self.STOP]
+        my_pos = ctx["my_pos"]
+        for action in self.DIRS:
+            npos = self._next_pos(my_pos, action)
+            if self._movement_action_legal(ctx, my_pos, npos, 1):
+                actions.append(action)
+        if ctx["my_bombs_left"] > 0 and my_pos not in ctx["bomb_positions"]:
+            actions.append(self.BOMB)
+        return actions
+
+    def _movement_action_legal(self, ctx, pos, npos, arrival_time):
+        if not self._passable(ctx["grid"], npos[0], npos[1]):
+            return False
+        return not self._bomb_blocks(pos, npos, arrival_time, ctx["bombs"])
+
+    def _bomb_blocks(self, from_pos, to_pos, arrival_time, bombs):
+        if to_pos == from_pos:
+            return False
+        for bomb in bombs:
+            if bomb["pos"] == to_pos and int(bomb.get("det_time", bomb["timer"])) >= arrival_time:
+                return True
+        return False
+
+    def _is_deadly(self, pos, time_step, danger_at):
+        return time_step in danger_at.get(pos, ())
+
+    def _is_future_safe(self, pos, time_step, danger_at):
+        for t in danger_at.get(pos, ()):
+            if t >= time_step:
+                return False
+        return True
+
+    def _next_danger_time(self, pos, time_step, danger_at):
+        best = None
+        for t in danger_at.get(pos, ()):
+            if t >= time_step and (best is None or t < best):
+                best = t
+        return best
+
+    def _passable(self, grid, x, y):
+        return self._in_bounds(grid, x, y) and int(grid[x, y]) in (
+            self.GRASS,
+            self.ITEM_RADIUS,
+            self.ITEM_CAPACITY,
+        )
+
+    def _in_bounds(self, grid, x, y):
+        return 0 <= int(x) < grid.shape[0] and 0 <= int(y) < grid.shape[1]
+
+    def _next_pos(self, pos, action):
+        dx, dy = self.MOVES.get(action, (0, 0))
+        return (pos[0] + dx, pos[1] + dy)
+
+    def _open_neighbors(self, grid, pos, bomb_positions):
+        count = 0
+        for action in self.DIRS:
+            nx, ny = self._next_pos(pos, action)
+            if self._passable(grid, nx, ny) and (nx, ny) not in bomb_positions:
+                count += 1
+        return count
+
+    def _ordered_actions_toward(self, pos, targets):
+        if not targets:
+            return self.SEARCH_ACTIONS
+        tx, ty = min(targets, key=lambda t: abs(pos[0] - t[0]) + abs(pos[1] - t[1]))
+        actions = self.DIRS[:]
+        actions.sort(
+            key=lambda a: abs(self._next_pos(pos, a)[0] - tx)
+            + abs(self._next_pos(pos, a)[1] - ty)
+        )
+        actions.append(self.STOP)
+        return actions
+
+    # ------------------------------------------------------------------
+    # Tactical geometry
+    # ------------------------------------------------------------------
+
+    def _line_blast_hits(self, grid, origin, target, radius):
+        ox, oy = origin
+        tx, ty = target
+        if ox == tx and abs(ty - oy) <= radius:
+            step = 1 if ty > oy else -1
+            for y in range(oy + step, ty, step):
+                if int(grid[ox, y]) in (self.WALL, self.BOX):
+                    return False
+            return True
+        if oy == ty and abs(tx - ox) <= radius:
+            step = 1 if tx > ox else -1
+            for x in range(ox + step, tx, step):
+                if int(grid[x, oy]) in (self.WALL, self.BOX):
+                    return False
+            return True
+        return False
+
+    def _adjacent_enemy(self, ctx, pos):
+        for enemy in ctx["enemies"]:
+            if self._manhattan(enemy["pos"], pos) <= 1:
+                return True
+        return False
+
+    def _manhattan(self, a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    # ------------------------------------------------------------------
+    # Last-ditch fallback
+    # ------------------------------------------------------------------
+
+    def _emergency_action(self, obs):
+        try:
+            grid = obs["map"]
+            players = obs["players"]
+            bombs = obs["bombs"]
+            if self.agent_id >= len(players) or int(players[self.agent_id][2]) != 1:
+                return 0
+            my_pos = (int(players[self.agent_id][0]), int(players[self.agent_id][1]))
+            danger_now = set()
+            bomb_positions = set()
+            for b in bombs:
+                bx, by, timer, owner = self._parse_bomb(b)
+                bomb_positions.add((bx, by))
+                if timer <= 1:
+                    radius = self._clamp_radius(1 + int(players[owner][4])) if 0 <= owner < len(players) else 2
+                    danger_now |= self._blast_tiles(grid, bx, by, radius)
+            for action in self.DIRS:
+                npos = self._next_pos(my_pos, action)
+                if self._passable(grid, npos[0], npos[1]) and npos not in bomb_positions and npos not in danger_now:
+                    return action
+            return 0
+        except Exception:
             return 0
 
-        # Thông tin bản thân
-        my_x, my_y, _, bombs_left, bomb_bonus = players[self.agent_id]
-        my_pos = (int(my_x), int(my_y))
-        bomb_radius = max(1, int(bomb_bonus) + 1)
+
+    def _evaluate_state(self, grid, my_pos, my_alive, enemies, bombs, danger_at):
+        if not my_alive: return -999999
+        score = -len(enemies) * 10000 
         
-        # Vật cản
-        bomb_positions = {(int(b[0]), int(b[1])) for b in bombs}
-        occupied = {(int(p[0]), int(p[1])) for i, p in enumerate(players) if i != self.agent_id and p[2] == 1}
-        blocked = set(occupied) | bomb_positions
-        blocked.discard(my_pos)
-
-        # Tính toán nguy hiểm
-        danger_soon, danger_now = _danger_tiles(grid, bombs, players)
-        valid_actions = _valid_actions(grid, my_pos, blocked)
-
-        # ========================================================
-        # RULE 1: SURVIVAL (Sinh tồn ưu tiên số 1)
-        # ========================================================
-        if my_pos in danger_now or my_pos in danger_soon:
-            escape_action = _move_to_safe(grid, my_pos, blocked, danger_soon)
-            if escape_action is not None:
-                return escape_action
+        # Space evaluation
+        escape = self._find_escape(grid, my_pos, 0, [], danger_at, 10)
+        e_space = 10 if escape is not None else 0
+        if e_space == 0: score -= 50000
+        else: score += e_space * 10
+        
+        score -= self._manhattan(my_pos, (grid.shape[0]//2, grid.shape[1]//2)) * 0.5
+        
+        for e_pos in enemies:
+            trap_escape = self._find_escape(grid, e_pos, 0, [], danger_at, 5)
+            trap_score = 5 if trap_escape is not None else 0
+            if trap_score == 0:
+                score += 10000 
+            
+            exits = 0
+            for a in [1, 2, 3, 4]:
+                nx, ny = self._next_pos(e_pos, a)
+                if self._passable(grid, nx, ny): exits += 1
+            if exits <= 1: score += 250
+            elif exits == 2: score += 100
                 
-            # FALLBACK: Nếu BFS thông thường không tìm được lối thoát, ta dùng Space-Time A*
-            danger_timeline = _build_danger_timeline(grid, bombs, players)
-            st_escape = _spacetime_move_to_safe(grid, my_pos, blocked, danger_timeline)
-            if st_escape is not None:
-                return st_escape
+        # cascade
+        true_timers = {b: b_info['timer'] for b, b_info in bombs.items()}
+        changed = True
+        while changed:
+            changed = False
+            for b1, i1 in bombs.items():
+                t1 = true_timers[b1]
+                blast1 = self._blast_tiles(grid, b1[0], b1[1], i1['radius'])
+                for b2, i2 in bombs.items():
+                    if b1 != b2 and b2 in blast1 and true_timers[b2] > t1:
+                        true_timers[b2] = t1
+                        changed = True
+        for b_pos, info in bombs.items():
+            t = true_timers[b_pos]
+            blast = self._blast_tiles(grid, b_pos[0], b_pos[1], info['radius'])
+            if t <= 5:
+                for e_pos in enemies:
+                    if e_pos in blast: score += 5000 * (6 - t)
+            if my_pos in blast:
+                score -= (10 - min(t, 9)) * 5000
+        return score
+
+    def _minimax(self, grid, my_pos, my_alive, enemies, bombs, my_bomb_radius, depth, start_time, time_limit, danger_at, tt, alpha=-float('inf'), beta=float('inf')):
+        import time
+        if not my_alive: return -999999, None
+        if not enemies: return self._evaluate_state(grid, my_pos, my_alive, enemies, bombs, danger_at), None
+        if depth == 0: return self._evaluate_state(grid, my_pos, my_alive, enemies, bombs, danger_at), None
+        
+        state_key = (my_pos, tuple(enemies), tuple((b, v['timer']) for b, v in bombs.items()))
+        if state_key in tt and tt[state_key]['type'] == 'EXACT':
+            return tt[state_key]['value'], tt[state_key]['action']
+            
+        valid_actions = [0, 1, 2, 3, 4, 5]
+            
+        max_score = -float('inf')
+        best_action = None
+        
+        for a in valid_actions:
+            n_my_pos = my_pos
+            n_bombs = {}
+            for b_pos, b_info in bombs.items():
+                t = b_info['timer'] - 1
+                n_bombs[b_pos] = {'timer': t, 'radius': b_info['radius']}
                 
-            # Không tìm được đường ra khỏi danger_soon, cố né danger_now
-            safe_now = [a for a in valid_actions if _next_pos(my_pos, a) not in danger_now]
-            return random.choice(safe_now) if safe_now else 0
-
-        # ========================================================
-        # Phân tích kẻ địch gần nhất
-        # ========================================================
-        closest_enemy_pos = None
-        min_dist = float('inf')
-        for i, p in enumerate(players):
-            if i != self.agent_id and p[2] == 1:
-                e_pos = (int(p[0]), int(p[1]))
-                dist = _shortest_path_length(grid, my_pos, e_pos, blocked)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_enemy_pos = e_pos
-
-        # ========================================================
-        # RULE 2: MINIMAX PARANOID 1v2
-        # ========================================================
-        # Chỉ kích hoạt Minimax nếu có địch ở gần để đảm bảo tốc độ
-        if closest_enemy_pos and min_dist <= 3:
-            start_time = time.perf_counter()
-            time_limit = 0.097 # 97ms timeout (sát nút 100ms)
-            best_minimax_action = None
-            max_depth = 3 # Cho phép Minimax chìm sâu hết cỡ nếu còn thời gian
-            
-            nearby_enemies = []
-            for p in players:
-                if p[2] == 1:
-                    epos = (int(p[0]), int(p[1]))
-                    if epos != my_pos and heuristic_dist(my_pos, epos) <= 4:
-                        nearby_enemies.append(epos)
-            
-            if nearby_enemies:
-                current_bombs_dict = {}
-                for b in bombs:
-                    owner_id = int(b[3]) if len(b) > 3 else -1
-                    rad = 2
-                    if 0 <= owner_id < len(players):
-                        rad = max(1, int(players[owner_id][4]) + 1)
-                    current_bombs_dict[(int(b[0]), int(b[1]))] = {'timer': int(b[2]), 'radius': rad}
+            if a == 5:
+                if my_pos not in n_bombs:
+                    n_bombs[my_pos] = {'timer': 9, 'radius': my_bomb_radius}
+            elif a != 0:
+                nx, ny = self._next_pos(my_pos, a)
+                if self._passable(grid, nx, ny):
+                    n_my_pos = (nx, ny)
                     
-                best_score = -float('inf')
-                tt = {}
-                reached_depth = 0
-                for d in range(1, max_depth + 1):
-                    score, action = _minimax(grid, my_pos, True, nearby_enemies, current_bombs_dict, bomb_radius, d, start_time, time_limit, occupied, tt)
+            n_my_alive = True
+            for b_pos, info in n_bombs.items():
+                if info['timer'] <= 0:
+                    blast = self._blast_tiles(grid, b_pos[0], b_pos[1], info['radius'])
+                    if n_my_pos in blast: n_my_alive = False
                     
-                    if time.perf_counter() - start_time > time_limit:
-                        break
-                        
-                    reached_depth = d
-                    if action is not None:
-                        best_minimax_action = action
-                        best_score = score
-                        
-                elapsed = time.perf_counter() - start_time
-                if elapsed > 0.08:
-                    print(f"[TIMING] Depth {reached_depth}/{max_depth} completed in {elapsed*1000:.2f}ms")
-                        
-                if best_minimax_action is not None:
-                    # Nếu đường nào cũng chết (score rất âm), Fallback về Heuristic
-                    if best_score > -10000:
-                        # Kiểm tra an toàn trước khi hành động (tránh đặt bom tự sát)
-                        if best_minimax_action == 5:
-                            if _can_escape_after_placing(grid, my_pos, blocked, danger_now, bomb_radius):
-                                return 5
-                        elif best_minimax_action == 0:
-                            if my_pos not in danger_soon:
-                                return 0
-                        else:
-                            # Đảm bảo bước đi an toàn
-                            nx, ny = _next_pos(my_pos, best_minimax_action)
-                            if (nx, ny) not in danger_now:
-                                return best_minimax_action
-
-        # ========================================================
-        # RULE 2.2: OPPORTUNISTIC TRAPPING (Kẹp chả)
-        # ========================================================
-        if bombs_left > 0 and len(bombs) > 0 and closest_enemy_pos and min_dist <= 4:
-            e_space_current = _escape_space_score(grid, closest_enemy_pos, blocked | danger_soon, max_depth=6)
-            if e_space_current > 0 and e_space_current <= 6:
-                virtual_danger_my = set(danger_now) | _blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
-                combined_danger_all = set(danger_soon) | virtual_danger_my
-                e_space_after = _escape_space_score(grid, closest_enemy_pos, blocked | combined_danger_all, max_depth=6)
-                if e_space_after == 0:
-                    if _can_escape_after_placing(grid, my_pos, blocked, danger_now, bomb_radius):
-                        return 5
-
-        # ========================================================
-        # RULE 2.5: DOUBLE-BOMB TRAP (Bẫy bom kép)
-        # ========================================================
-        if bombs_left >= 2 and closest_enemy_pos and min_dist <= 3:
-            # Thử thả bom 1 ở vị trí hiện tại
-            virtual_danger_1 = set(danger_now) | _blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
-            e_space_1 = _escape_space_score(grid, closest_enemy_pos, blocked | {my_pos}, max_depth=5)
+            n_bombs = {k: v for k, v in n_bombs.items() if v['timer'] > 0}
             
-            # Nếu thả bom 1 chưa đủ ép chết địch, nhưng không gian bị thu hẹp đáng kể
-            if e_space_1 > 0 and e_space_1 <= 6:
-                for a in valid_actions:
-                    if a != 0:
-                        npos = _next_pos(my_pos, a)
-                        # Giả định bước tới npos và thả quả thứ 2
-                        virtual_danger_2 = virtual_danger_1 | _blast_tiles(grid, npos[0], npos[1], bomb_radius)
-                        e_space_2 = _escape_space_score(grid, closest_enemy_pos, blocked | {my_pos, npos}, max_depth=5)
-                        if e_space_2 == 0:
-                            # Địch hoàn toàn hết lối thoát
-                            if _can_escape_after_placing(grid, my_pos, blocked, danger_now, bomb_radius):
-                                return 5
-
-        # ========================================================
-        # RULE 3: AGGRESSIVE TRAPPING (Áp sát & Đặt bom ép góc thường)
-        # ========================================================
-        if bombs_left > 0 and closest_enemy_pos and min_dist <= 3:
-            e_space = _enemy_trapped_score(grid, closest_enemy_pos, blocked)
-            if e_space <= 6:
-                if _can_escape_after_placing(grid, my_pos, blocked, danger_now, bomb_radius):
-                    return 5
-
-        # ========================================================
-        # RULE 4: FARMING ITEMS & BOXES
-        # ========================================================
-        items = _item_tiles(grid, prefer_capacity=(bombs_left <= 1), prefer_radius=(bomb_bonus <= 1))
-        if items:
-            # Tránh lấy item ở ngõ cụt sâu (không gian thoát < 3)
-            safe_items = {item for item in items if _escape_space_score(grid, item, blocked, max_depth=4) >= 3}
-            if not safe_items:
-                safe_items = set(items)
-            move = _astar_to_targets(grid, my_pos, safe_items, blocked, danger_soon)
-            if move is not None:
-                return move
-
-        boxes_here = _count_boxes_in_blast(grid, my_pos[0], my_pos[1], bomb_radius)
-        if bombs_left > 0 and boxes_here > 0:
-            if _can_escape_after_placing(grid, my_pos, blocked, danger_now, bomb_radius):
-                return 5
-
-        box_spots = _box_bomb_spots(grid, blocked)
-        if box_spots:
-            # Tránh đặt bom ở ngõ cụt để lấy hộp, rất dễ bị kẹp chết
-            safe_spots = {spot for spot in box_spots if _escape_space_score(grid, spot, blocked, max_depth=4) >= 3}
-            if not safe_spots:
-                safe_spots = set(box_spots)
-            move = _astar_to_targets(grid, my_pos, safe_spots, blocked, danger_soon)
-            if move is not None:
-                return move
-
-        # ========================================================
-        # RULE 5: HUNT ENEMY OR WANDER
-        # ========================================================
-        if closest_enemy_pos:
-            move = _astar_to_targets(grid, my_pos, {closest_enemy_pos}, blocked, danger_soon)
-            if move is not None:
-                return move
-
-        safe_moves = [a for a in valid_actions if _next_pos(my_pos, a) not in danger_soon]
-        if safe_moves:
-            # Chọn nước đi hướng ra không gian rộng rãi (tránh ngõ cụt)
-            best_move = safe_moves[0]
-            best_space = -1
-            for a in safe_moves:
-                nx, ny = _next_pos(my_pos, a)
-                space = _escape_space_score(grid, (nx, ny), blocked | set(danger_soon), max_depth=10)
-                if space > best_space:
-                    best_space = space
-                    best_move = a
-            return best_move
-        return 0
+            min_score = float('inf')
+            
+            n_enemies = []
+            for e_pos in enemies:
+                best_e_dist = 999
+                best_e_pos = e_pos
+                for ea in [0, 1, 2, 3, 4]:
+                    ex, ey = self._next_pos(e_pos, ea)
+                    if self._passable(grid, ex, ey):
+                        dist = self._manhattan((ex, ey), n_my_pos)
+                        if dist < best_e_dist:
+                            best_e_dist = dist
+                            best_e_pos = (ex, ey)
+                n_enemies.append(best_e_pos)
+                
+            n_enemies_alive = []
+            for e_pos in n_enemies:
+                e_alive = True
+                for b_pos, info in n_bombs.items():
+                    if info['timer'] <= 0:
+                        blast = self._blast_tiles(grid, b_pos[0], b_pos[1], info['radius'])
+                        if e_pos in blast: e_alive = False
+                if e_alive: n_enemies_alive.append(e_pos)
+                
+            score, _ = self._minimax(grid, n_my_pos, n_my_alive, n_enemies_alive, n_bombs, my_bomb_radius, depth - 1, start_time, time_limit, danger_at, tt, alpha, min(beta, min_score))
+            
+            if score < min_score: min_score = score
+                
+            if min_score > max_score:
+                max_score = min_score
+                best_action = a
+                
+            if time.perf_counter() - start_time > time_limit: break
+            if max_score >= beta: break
+            if max_score > alpha: alpha = max_score
+            
+        tt[state_key] = {'value': max_score, 'action': best_action, 'type': 'EXACT'}
+        return max_score, best_action
