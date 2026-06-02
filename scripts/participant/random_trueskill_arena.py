@@ -25,6 +25,8 @@ DEFAULT_AGENTS = [
     "TacticalRuleAgent",
 ]
 
+WIN_REASON_KEYS = ("survival", "kills", "boxes", "items", "bombs")
+
 
 def score(rating):
     return float(rating.mu) - 3.0 * float(rating.sigma)
@@ -118,6 +120,26 @@ def compute_dense_ranks(env, alive_final, death_steps):
     return ranks
 
 
+def determine_win_reason(env, alive_final, ranks):
+    winners = [i for i, rank in enumerate(ranks) if rank == min(ranks)]
+    if len(winners) != 1:
+        return None
+
+    winner = winners[0]
+    survivors = [i for i, alive in enumerate(alive_final) if alive]
+    if not alive_final[winner] or len(survivors) <= 1:
+        return "survival"
+
+    # At max_steps, multiple survivors are separated by the official tie-break
+    # order: kills, boxes, items, bombs. Return the first stat that makes the
+    # unique winner strictly better than every other survivor.
+    winner_stats = env.players[winner].stats
+    for key in ("kills", "boxes", "items", "bombs"):
+        if all(int(winner_stats[key]) > int(env.players[i].stats[key]) for i in survivors if i != winner):
+            return key
+    return "survival"
+
+
 def run_one_match(agent_specs, seed, max_steps):
     env = BomberEnv(max_steps=max_steps, seed=seed)
     agents, _ = make_agents(agent_specs, seed=seed)
@@ -155,6 +177,7 @@ def run_one_match(agent_specs, seed, max_steps):
 
     alive_final = [bool(p[2]) for p in obs["players"]]
     ranks = compute_dense_ranks(env, alive_final, death_steps)
+    win_reason = determine_win_reason(env, alive_final, ranks)
     survival_steps = [step if alive_final[i] else int(death_steps[i] or step) for i in range(4)]
     stats = [dict(env.players[i].stats) for i in range(4)]
     return {
@@ -162,7 +185,10 @@ def run_one_match(agent_specs, seed, max_steps):
         "agent_specs": list(agent_specs),
         "names": names,
         "ranks": ranks,
+        "win_reason": win_reason,
         "steps": step,
+        "alive_final": alive_final,
+        "death_steps": death_steps,
         "survival_steps": survival_steps,
         "stats": stats,
         "action_errors": action_errors,
@@ -186,12 +212,15 @@ def update_table(table, ratings, ts_env, match_result, recency_by_name):
         row["wins"] += 1 if slot in winners and len(winners) == 1 else 0
         row["draws"] += 1 if slot in winners and len(winners) > 1 else 0
         row["losses"] += 1 if slot not in winners else 0
+        row["deaths"] += 1 if match_result["death_steps"][slot] is not None else 0
         row["total_rank"] += int(ranks[slot])
         row["total_steps"] += int(match_result["survival_steps"][slot])
         row["action_errors"] += int(match_result["action_errors"][slot])
         row["invalid_actions"] += int(match_result["invalid_actions"][slot])
         for key in ("kills", "boxes", "items", "bombs"):
             row[key] += int(match_result["stats"][slot][key])
+        if slot in winners and len(winners) == 1 and match_result["win_reason"] in WIN_REASON_KEYS:
+            row[f"win_by_{match_result['win_reason']}"] += 1
         row["recency"] = recency_by_name.get(name, row["recency"])
 
 
@@ -200,6 +229,7 @@ def leaderboard_rows(table, ratings):
     for name, row in table.items():
         rating = ratings[name]
         games = max(1, row["games"])
+        wins = max(1, row["wins"])
         rows.append(
             {
                 "name": name,
@@ -210,6 +240,7 @@ def leaderboard_rows(table, ratings):
                 "wins": row["wins"],
                 "draws": row["draws"],
                 "losses": row["losses"],
+                "deaths": row["deaths"],
                 "win_rate": row["wins"] / games,
                 "avg_rank": row["total_rank"] / games,
                 "avg_steps": row["total_steps"] / games,
@@ -217,6 +248,16 @@ def leaderboard_rows(table, ratings):
                 "boxes": row["boxes"],
                 "items": row["items"],
                 "bombs": row["bombs"],
+                "win_by_survival": row["win_by_survival"],
+                "win_by_kills": row["win_by_kills"],
+                "win_by_boxes": row["win_by_boxes"],
+                "win_by_items": row["win_by_items"],
+                "win_by_bombs": row["win_by_bombs"],
+                "win_survival_pct": row["win_by_survival"] / wins,
+                "win_kills_pct": row["win_by_kills"] / wins,
+                "win_boxes_pct": row["win_by_boxes"] / wins,
+                "win_items_pct": row["win_by_items"] / wins,
+                "win_bombs_pct": row["win_by_bombs"] / wins,
                 "action_errors": row["action_errors"],
                 "invalid_actions": row["invalid_actions"],
                 "recency": row["recency"],
@@ -229,7 +270,7 @@ def leaderboard_rows(table, ratings):
 def print_leaderboard(rows):
     header = (
         "rank name                         score      mu   sigma games  W  D  L "
-        "avgR  win% kills boxes items bombs"
+        "death avgR  win% kills boxes items bombs surv% kill% box% item% bomb%"
     )
     print(header)
     print("-" * len(header))
@@ -238,8 +279,11 @@ def print_leaderboard(rows):
             f"{i:>4} {row['name'][:28]:<28} "
             f"{row['score']:>7.2f} {row['mu']:>7.2f} {row['sigma']:>6.2f} "
             f"{row['games']:>5} {row['wins']:>2} {row['draws']:>2} {row['losses']:>2} "
-            f"{row['avg_rank']:>4.2f} {row['win_rate'] * 100:>5.1f} "
-            f"{row['kills']:>5} {row['boxes']:>5} {row['items']:>5} {row['bombs']:>5}"
+            f"{row['deaths']:>5} {row['avg_rank']:>4.2f} {row['win_rate'] * 100:>5.1f} "
+            f"{row['kills']:>5} {row['boxes']:>5} {row['items']:>5} {row['bombs']:>5} "
+            f"{row['win_survival_pct'] * 100:>5.1f} {row['win_kills_pct'] * 100:>5.1f} "
+            f"{row['win_boxes_pct'] * 100:>4.1f} {row['win_items_pct'] * 100:>5.1f} "
+            f"{row['win_bombs_pct'] * 100:>5.1f}"
         )
 
 
@@ -287,12 +331,18 @@ def main():
             "wins": 0,
             "draws": 0,
             "losses": 0,
+            "deaths": 0,
             "total_rank": 0,
             "total_steps": 0,
             "kills": 0,
             "boxes": 0,
             "items": 0,
             "bombs": 0,
+            "win_by_survival": 0,
+            "win_by_kills": 0,
+            "win_by_boxes": 0,
+            "win_by_items": 0,
+            "win_by_bombs": 0,
             "action_errors": 0,
             "invalid_actions": 0,
             "recency": idx,
