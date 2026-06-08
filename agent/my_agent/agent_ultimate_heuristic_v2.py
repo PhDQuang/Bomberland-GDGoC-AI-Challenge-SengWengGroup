@@ -1,39 +1,9 @@
-import os
-import sys
-import torch
-import numpy as np
-import torch.nn as nn
-
-class DirectorNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(8, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(128 * 13 * 13, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 6) # 6 Tempos/Modes
-        )
-        
-    def forward(self, x):
-        x = self.conv(x)
-        return self.fc(x)
-
 from collections import deque
 import time
 
 
 class Agent:
-    team_id = "RLDirector_ProV2_Final"
+    team_id = "UltimateHeuristicV2"
 
     GRASS = 0
     WALL = 1
@@ -58,21 +28,12 @@ class Agent:
     DIRS = [LEFT, RIGHT, UP, DOWN]
     SEARCH_ACTIONS = [LEFT, RIGHT, UP, DOWN, STOP]
     MAX_RADIUS = 5
+    MAX_BOMBS = 5
     MAX_CAPACITY = 5
     HORIZON = 15
 
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
-        
-        # Load DirectorNet
-        self.director = DirectorNet()
-        model_path = os.path.join(os.path.dirname(__file__), "models", "directoragent.pt")
-        self.director_loaded = os.path.exists(model_path)
-        if self.director_loaded:
-            self.director.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
-            self.director.eval()
-        self.force_tempo = None
-        
         self.bomb_radii = {}
         self.last_bonuses = None
         self.turn = 0
@@ -112,7 +73,9 @@ class Agent:
             self._remember_player_bonuses(players)
             self._snapshot_obs(obs)
             return int(action)
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             return int(self._emergency_action(obs))
 
     # ------------------------------------------------------------------
@@ -384,10 +347,10 @@ class Agent:
             "phase": phase,
             "valid_actions": None,
         }
-        strategic_mode, target_enemy_id = self._strategic_mode(ctx)
-        ctx["strategic_mode"] = strategic_mode
+        mode, aggression, target_enemy_id = self._analyze_macro_state(ctx)
+        ctx["mode"] = mode
+        ctx["aggression"] = aggression
         ctx["target_enemy_id"] = target_enemy_id
-        ctx["tempo"] = self._tempo_mode(ctx)
         ctx["engagement_deficit"] = self._engagement_deficit(ctx)
         ctx["valid_actions"] = self._valid_actions(ctx)
         return ctx
@@ -410,146 +373,81 @@ class Agent:
                     total += 1
         return total
 
-    def _strategic_mode(self, ctx):
+    def _analyze_macro_state(self, ctx):
         my_stats = ctx["my_stats"]
+        alive_count = ctx["alive_count"]
+        power = ctx["my_radius"] + max(ctx["my_bombs_left"], ctx["max_bombs_left_seen"])
+        
+        stats = ctx["telemetry"]
+        progress_age = self.turn - int(stats.get("last_progress_turn", 0))
+        if progress_age >= 75 and alive_count >= 3:
+            return "unstuck", 0.0, None
+            
+        def get_score(s):
+            return int(s.get("kills", 0)) * 1000 + int(s.get("boxes", 0)) * 10 + int(s.get("items", 0))
+            
+        my_score = get_score(my_stats)
+        is_winning = True
+        enemy_stats = []
         alive_enemy_ids = {enemy["id"] for enemy in ctx["enemies"]}
-        enemy_stats = [
-            (i, stats)
-            for i, stats in enumerate(ctx["estimated_stats"])
-            if i != self.agent_id and i in alive_enemy_ids
-        ]
+        for enemy in ctx["enemies"]:
+            s = ctx["estimated_stats"][enemy["id"]]
+            enemy_stats.append((enemy["id"], s))
+            if get_score(s) > my_score:
+                is_winning = False
 
-        if int(my_stats.get("kills", 0)) >= 2:
-            return "escape", None
+        my_kills = int(my_stats.get("kills", 0))
+
+        if my_kills >= 2:
+            return "escape", 0.0, None
 
         killer_enemies = [(i, s) for i, s in enemy_stats if int(s.get("kills", 0)) >= 2]
         if killer_enemies:
             target = max(killer_enemies, key=lambda item: (int(item[1].get("kills", 0)), int(item[1].get("boxes", 0))))[0]
-            return "hunt", target
+            return "combat", 0.9, target
 
-        if ctx["alive_count"] == 2 and ctx["enemies"]:
-            enemy = ctx["enemies"][0]
-            enemy_id = enemy["id"]
+        if alive_count == 2 and ctx["enemies"]:
+            enemy_id = ctx["enemies"][0]["id"]
             enemy_s = ctx["estimated_stats"][enemy_id]
-            my_kills = int(my_stats.get("kills", 0))
             enemy_kills = int(enemy_s.get("kills", 0))
             my_boxes = int(my_stats.get("boxes", 0))
             enemy_boxes = int(enemy_s.get("boxes", 0))
+            
             if enemy_kills > my_kills:
-                return "hunt", enemy_id
+                return "combat", 0.9, enemy_id
             if enemy_kills == my_kills and enemy_boxes == my_boxes:
                 my_items = int(my_stats.get("items", 0))
                 enemy_items = int(enemy_s.get("items", 0))
                 item_gap = my_items - enemy_items
                 steps_left = max(0, 500 - self.turn)
                 if abs(item_gap) * 10 <= steps_left:
-                    return "item_race", enemy_id
+                    return "economy", 0.4, None
                 if item_gap > 0:
-                    return "escape", None
-                return "hunt", enemy_id
+                    return "escape", 0.0, None
+                return "combat", 0.8, enemy_id
             if my_kills > enemy_kills or my_boxes > enemy_boxes:
-                return "escape", None
+                return "escape", 0.0, None
 
         if ctx["boxes_remaining"] == 0:
             my_boxes = int(my_stats.get("boxes", 0))
-            max_boxes = max(int(stats.get("boxes", 0)) for stats in ctx["estimated_stats"])
+            max_boxes = max([int(s.get("boxes", 0)) for i, s in enemy_stats] + [0])
             if my_boxes < max_boxes and ctx["enemies"]:
-                target = max(ctx["enemies"], key=lambda e: (int(e["stats"].get("boxes", 0)), int(e["stats"].get("kills", 0))))["id"]
-                return "hunt", target
+                target = max(ctx["enemies"], key=lambda e: (int(ctx["estimated_stats"][e["id"]].get("boxes", 0)), int(ctx["estimated_stats"][e["id"]].get("kills", 0))))["id"]
+                return "combat", 0.8, target
 
-        if ctx["boxes_remaining"] > 0:
-            my_boxes = int(my_stats.get("boxes", 0))
-            max_boxes = max(int(stats.get("boxes", 0)) for stats in ctx["estimated_stats"])
-            if my_boxes + 2 < max_boxes and ctx["phase"] != "end":
-                return "box_farm", None
-
-        return "adaptive", None
-
-    
-    def _extract_features(self, ctx):
-        grid = ctx["grid"]
-        h, w = grid.shape
-        C = 8
-        features = np.zeros((C, h, w), dtype=np.float32)
-        
-        # 1. Tường cứng (Wall)
-        features[0] = (grid == 1).astype(np.float32)
-        # 2. Hộp gỗ (Box)
-        features[1] = (grid == 2).astype(np.float32)
-        # 3. Vật phẩm
-        features[2] = ((grid == 3) | (grid == 4)).astype(np.float32)
-        
-        # 4. Vị trí bản thân
-        my_pos = ctx["my_pos"]
-        features[3, my_pos[0], my_pos[1]] = 1.0
-        
-        # 5. Vị trí kẻ thù
-        for e in ctx["enemies"]:
-            features[4, e["pos"][0], e["pos"][1]] = 1.0
-            
-        # 6. Bom
-        for b in ctx["bombs"]:
-            features[5, b["pos"][0], b["pos"][1]] = max(0, 1.0 - (b["timer"] / 40.0))
-
-        # 7. Danger Map
-        danger_at = ctx.get("danger_at", {})
-        for (x, y), t_set in danger_at.items():
-            min_t = min(t_set) if isinstance(t_set, set) and t_set else (t_set if not isinstance(t_set, set) else 40)
-            features[6, x, y] = max(0, 1.0 - (min_t / 40.0))
-
-        # 8. Earliest
-        earliest = ctx.get("earliest", {})
-        for (x, y), t in earliest.items():
-            features[7, x, y] = max(0, 1.0 - (t / 40.0))
-            
-        return features
-
-    def _tempo_mode(self, ctx):
-        # Preserve strategic modes from AdaptiveProV2
-        strategic = ctx.get("strategic_mode", "adaptive")
-        if strategic in ("escape", "hunt", "item_race", "box_farm"):
-            return strategic
-            
-        if hasattr(self, 'force_tempo') and self.force_tempo is not None:
-            return self.force_tempo
-            
-        if hasattr(self, 'director_loaded') and self.director_loaded:
-            f = self._extract_features(ctx)
-            batch_t = torch.tensor(np.array([f]), dtype=torch.float32)
-            with torch.no_grad():
-                logits = self.director(batch_t)
-                pred_idx = torch.argmax(logits, dim=1).item()
-                
-            id_to_tempo = {0: "economy", 1: "unstuck", 2: "pressure", 3: "duel", 4: "tiebreak", 5: "survive_duel"}
-            return id_to_tempo[pred_idx]
-            
-        return self._fallback_tempo_mode(ctx)
-
-    def _fallback_tempo_mode(self, ctx):
-        strategic = ctx.get("strategic_mode", "adaptive")
-        if strategic == "escape":
-            return "escape"
-        if strategic == "hunt":
-            return "hunt"
-        if strategic == "item_race":
-            return "item_race"
-        if strategic == "box_farm":
-            return "box_farm"
-        stats = ctx["telemetry"]
-        progress_age = self.turn - int(stats.get("last_progress_turn", 0))
-        power = ctx["my_radius"] + max(ctx["my_bombs_left"], ctx["max_bombs_left_seen"])
-        if ctx["phase"] == "end":
-            return "duel" if power >= 4 else "survive_duel"
-        if self.turn >= 360:
-            return "tiebreak"
-        if progress_age >= 75 and ctx["alive_count"] >= 3:
-            return "unstuck"
-        if ctx["phase"] == "early" and self.turn < 220:
-            if ctx["my_bonus"] <= 1 or ctx["max_bombs_left_seen"] <= 1:
-                return "economy"
-        if power >= 5 and self.turn >= 90:
-            return "pressure"
-        return "balanced"
+        if alive_count == 4:
+            return "economy", 0.3, None
+        elif alive_count == 3:
+            if is_winning:
+                return "economy", 0.2, None
+            else:
+                if power >= 3:
+                    target = max(ctx["enemies"], key=lambda e: get_score(ctx["estimated_stats"][e["id"]]))["id"]
+                    return "combat", 0.7, target
+                else:
+                    return "economy", 0.3, None
+                    
+        return "economy", 0.3, None
 
     def _engagement_deficit(self, ctx):
         stats = ctx["telemetry"]
@@ -581,10 +479,18 @@ class Agent:
                 return action
             return self._fallback_action(ctx)
 
-        if ctx["strategic_mode"] == "escape":
-            action = self._best_survival_action(ctx)
+        if ctx["mode"] == "escape":
+            action = self._best_escape_action(ctx)
             if action is not None:
                 return action
+
+        # === V3: Minimax for 1v1 endgame ===
+        if ctx["alive_count"] == 2 and time.perf_counter() - started < 0.06:
+            mm_action = self._minimax_decide(ctx, started)
+            if mm_action is not None:
+                if mm_action == self.BOMB:
+                    self.escape_mode = True
+                return mm_action
 
         current_bomb = self._score_bomb_at(ctx, my_pos)
         if current_bomb["legal"] and current_bomb["score"] >= self._bomb_threshold(current_bomb):
@@ -604,28 +510,53 @@ class Agent:
 
         return self._fallback_action(ctx)
 
+    def _minimax_decide(self, ctx, started):
+        """V3: Use minimax in 1v1 endgame for optimal play."""
+        try:
+            grid = ctx["grid"]
+            my_pos = ctx["my_pos"]
+            enemies_pos = [e["pos"] for e in ctx["enemies"]]
+            if not enemies_pos:
+                return None
+            bombs_dict = {}
+            for b in ctx["bombs"]:
+                bombs_dict[b["pos"]] = {"timer": b["timer"], "radius": b["radius"]}
+            score, action = self._minimax(
+                grid, my_pos, True, enemies_pos, bombs_dict,
+                ctx["my_radius"], depth=3, start_time=started,
+                time_limit=0.07, danger_at=ctx["danger_at"], tt={}
+            )
+            if action is not None and score > -500000:
+                return action
+        except Exception:
+            pass
+        return None
+
     def _bomb_threshold(self, bomb):
         phase = bomb.get("phase", "mid")
-        tempo = bomb.get("tempo", "balanced")
-        if tempo == "escape":
+        mode = bomb.get("mode", "economy")
+        aggression = bomb.get("aggression", 0.5)
+
+        if mode == "escape":
             return 10**6
+
         safety_tax = 0.0
         if bomb.get("slack", 7) < 3:
             safety_tax += 2.0
         if bomb.get("escape_area", 10) <= 4:
             safety_tax += 1.0
-        if tempo in ("pressure", "tiebreak", "duel") and (bomb["enemy_hits"] or bomb["trap_score"] >= 1.0):
-            safety_tax -= 0.7
-        if tempo == "economy" and bomb["enemy_hits"] == 0:
-            safety_tax -= min(0.8, 0.25 * bomb["boxes"])
-        if tempo == "unstuck" and bomb["boxes"] > 0:
+
+        if mode == "combat":
+            if bomb["enemy_hits"] or bomb["trap_score"] >= 1.0:
+                safety_tax -= 0.7 + aggression * 0.7
+        elif mode == "economy":
+            if bomb["enemy_hits"] > 0:
+                safety_tax -= 1.8
+            elif bomb["enemy_hits"] == 0:
+                safety_tax -= min(0.8 + (1.0 - aggression)*0.8, (0.25 + (1.0-aggression)*0.2) * bomb["boxes"])
+        elif mode == "unstuck" and bomb["boxes"] > 0:
             safety_tax -= 0.9
-        if tempo == "hunt" and (bomb["enemy_hits"] or bomb["trap_score"] >= 0.8):
-            safety_tax -= 1.4
-        if tempo == "box_farm" and bomb["boxes"] > 0:
-            safety_tax -= min(1.6, 0.45 * bomb["boxes"])
-        if tempo == "item_race":
-            safety_tax += 0.8
+
         if bomb["enemy_hits"] or bomb["trap_score"] >= 1.5:
             return (3.6 if phase == "end" else 5.5 if self.turn < 120 else 4.2) + safety_tax
         if bomb["boxes"] >= 3:
@@ -637,89 +568,144 @@ class Agent:
         return (4.2 if phase == "end" else 6.0) + safety_tax
 
     def _choose_objective(self, ctx, started):
+        import time
+        mode = ctx.get("mode", "economy")
+        aggression = ctx.get("aggression", 0.5)
+        reach = self._temporal_reach_map(ctx, 12)
+
+        if mode == "escape":
+            return self._best_escape_action(ctx)
+        if mode == "unstuck":
+            return self._unstuck_action(ctx, started) if hasattr(self, '_unstuck_action') else None
+
         best = None
 
-        if time.perf_counter() - started > 0.08:
-            return None
+        if mode == "economy" or (mode == "combat" and aggression < 0.8):
+            item_choice = self._best_item_move(ctx, reach)
+            if item_choice is not None:
+                best = item_choice
 
-        reach = self._temporal_reach_map(ctx, self.HORIZON)
-
-        if ctx["strategic_mode"] == "hunt":
-            enemy_choice = self._best_enemy_pressure_move(ctx, reach)
-            if enemy_choice is not None:
-                best = enemy_choice
-            if time.perf_counter() - started < 0.085:
-                chase_choice = self._best_chase_space_move(ctx, reach)
-                if chase_choice is not None and (best is None or chase_choice[0] > best[0]):
-                    best = chase_choice
-            return best[1] if best is not None else None
-
-        item_choice = self._best_item_move(ctx, reach)
-        if item_choice is not None:
-            best = item_choice
-
-        if ctx["strategic_mode"] == "item_race" and best is not None:
-            return best[1]
-
-        if time.perf_counter() - started < 0.075:
             box_choice = self._best_box_position_move(ctx, reach)
             if box_choice is not None and (best is None or box_choice[0] > best[0]):
                 best = box_choice
 
-        if ctx["strategic_mode"] == "box_farm" and best is not None:
-            return best[1]
+        if mode == "combat" or (mode == "economy" and aggression >= 0.3):
+            if time.perf_counter() - started < 0.08:
+                enemy_choice = self._best_enemy_pressure_move(ctx, reach)
+                if enemy_choice is not None and (best is None or enemy_choice[0] > best[0]):
+                    best = enemy_choice
 
-        if time.perf_counter() - started < 0.08:
-            enemy_choice = self._best_enemy_pressure_move(ctx, reach)
-            if enemy_choice is not None and (best is None or enemy_choice[0] > best[0]):
-                best = enemy_choice
+            if mode == "combat" and time.perf_counter() - started < 0.082:
+                trap_choice = self._best_corridor_trap_move(ctx, reach)
+                if trap_choice is not None and (best is None or trap_choice[0] > best[0]):
+                    best = trap_choice
 
-        should_chase = ctx["tempo"] == "tiebreak" and ctx["engagement_deficit"] >= 2
-        should_chase = should_chase or (ctx["tempo"] == "duel" and best is None)
-        if time.perf_counter() - started < 0.085 and should_chase:
-            chase_choice = self._best_chase_space_move(ctx, reach)
-            if chase_choice is not None and (best is None or chase_choice[0] > best[0]):
-                best = chase_choice
+            if mode == "combat" and aggression >= 0.5 and time.perf_counter() - started < 0.085:
+                chase_choice = self._best_chase_space_move(ctx, reach)
+                if chase_choice is not None and (best is None or chase_choice[0] > best[0]):
+                    best = chase_choice
 
-        if best is None:
+        return best[1] if best is not None else None
+
+    def _best_corridor_trap_move(self, ctx, reach):
+        """V3: Find positions where placing a bomb would cut off enemy escape routes."""
+        if ctx["my_bombs_left"] <= 0 or not ctx["enemies"]:
             return None
-        return best[1]
+        grid = ctx["grid"]
+        best = None
+        for enemy in ctx["enemies"]:
+            epos = enemy["pos"]
+            # Find enemy's escape routes
+            enemy_exits = []
+            for action in self.DIRS:
+                npos = self._next_pos(epos, action)
+                if self._passable(grid, npos[0], npos[1]) and npos not in ctx["bomb_positions"]:
+                    enemy_exits.append(npos)
+            if len(enemy_exits) <= 2:  # Enemy already has limited exits
+                for exit_pos in enemy_exits:
+                    # Can I place a bomb that blocks this exit?
+                    blocking_positions = []
+                    # The exit itself
+                    if self._passable(grid, exit_pos[0], exit_pos[1]):
+                        blocking_positions.append(exit_pos)
+                    # Positions whose blast covers the exit
+                    for bx in range(max(1, exit_pos[0] - ctx["my_radius"]), min(grid.shape[0] - 1, exit_pos[0] + ctx["my_radius"] + 1)):
+                        if self._passable(grid, bx, exit_pos[1]) and (bx, exit_pos[1]) not in ctx["bomb_positions"]:
+                            if self._line_blast_hits(grid, (bx, exit_pos[1]), exit_pos, ctx["my_radius"]):
+                                blocking_positions.append((bx, exit_pos[1]))
+                    for by in range(max(1, exit_pos[1] - ctx["my_radius"]), min(grid.shape[1] - 1, exit_pos[1] + ctx["my_radius"] + 1)):
+                        if self._passable(grid, exit_pos[0], by) and (exit_pos[0], by) not in ctx["bomb_positions"]:
+                            if self._line_blast_hits(grid, (exit_pos[0], by), exit_pos, ctx["my_radius"]):
+                                blocking_positions.append((exit_pos[0], by))
+                    for bpos in blocking_positions:
+                        path = reach.get(bpos)
+                        if path is None:
+                            continue
+                        dist, action = path
+                        if dist > 8:
+                            continue
+                        # Score: higher when enemy has fewer exits and we're closer
+                        value = 8.0 - len(enemy_exits) * 2.0 - dist * 0.3
+                        # Bonus if this also directly threatens the enemy
+                        if self._line_blast_hits(grid, bpos, epos, ctx["my_radius"]):
+                            value += 4.0
+                        # Make sure we can escape after placing bomb here
+                        if bpos in ctx["enemy_risk"]:
+                            value -= 1.5
+                        if best is None or value > best[0]:
+                            best = (value, action)
+        return best
 
     # ------------------------------------------------------------------
     # Bomb scoring and objectives
     # ------------------------------------------------------------------
 
     def _score_bomb_at(self, ctx, pos):
+        grid = ctx["grid"]
+        bombs = ctx["bombs"]
+        danger_at = ctx["danger_at"]
+        my_pos = ctx["my_pos"]
+        radius = ctx["my_radius"]
+
+        if grid[pos] in (self.WALL, self.BOX) or any(
+            b["pos"] == pos for b in bombs
+        ):
+            return {"legal": False, "score": 0.0, "boxes": 0, "enemy_hits": []}
+
         if ctx["my_bombs_left"] <= 0 or pos in ctx["bomb_positions"]:
             return self._illegal_bomb_score()
 
-        grid = ctx["grid"]
-        radius = ctx["my_radius"]
-        blast = self._blast_tiles(grid, pos[0], pos[1], radius)
-        boxes = sum(1 for tile in blast if int(grid[tile[0], tile[1]]) == self.BOX)
-        enemy_hits = [enemy for enemy in ctx["enemies"] if enemy["pos"] in blast]
+        hypo_bombs = [dict(b) for b in bombs]
+        hypo_bombs.append(
+            {
+                "pos": pos,
+                "timer": 7,
+                "owner": self.agent_id,
+                "radius": radius,
+                "hypothetical": True,
+            }
+        )
+        schedule = self._compute_schedule(grid, hypo_bombs)
+        hypo_danger = schedule["danger_at"]
 
-        hypo_bombs, hypo_danger, hypo_earliest = self._hypothetical_schedule(ctx, pos, radius)
         if self._is_deadly(pos, 1, hypo_danger):
             return self._illegal_bomb_score()
 
-        escape = self._find_escape(
-            grid,
-            pos,
-            1,
-            hypo_bombs,
-            hypo_danger,
-            horizon=self.HORIZON,
-        )
-        if escape is None:
+        my_escape = self._find_escape(grid, pos, 1, hypo_bombs, hypo_danger, 8, enemies=ctx.get("enemies"))
+        if my_escape is None:
             return self._illegal_bomb_score()
 
-        escape_action, escape_time, escape_pos = escape
-        own_det = 7
-        slack = own_det - escape_time
+        _, safe_t, safe_pos = my_escape
         escape_area = self._reachable_count(
-            ctx, escape_pos, escape_time, hypo_bombs, hypo_danger, 8
+            ctx, safe_pos, safe_t, hypo_bombs, hypo_danger, 15
         )
+        slack = max(0, 7 - safe_t)
+
+        blast = self._blast_tiles(grid, pos[0], pos[1], radius)
+        boxes = sum(1 for tx, ty in blast if grid[tx, ty] == self.BOX)
+        enemy_hits = [
+            e for e in ctx["enemies"] if e["pos"] in blast and self._is_future_safe(e["pos"], 1, danger_at)
+        ]
 
         trap_score = 0.0
         for enemy in ctx["enemies"]:
@@ -729,21 +715,13 @@ class Agent:
                     trap_score += 0.25
                 continue
             enemy_escape = self._find_escape(
-                grid,
-                epos,
-                0,
-                hypo_bombs,
-                hypo_danger,
-                horizon=7,
-                ignore_start_bomb=True,
+                grid, epos, 0, hypo_bombs, hypo_danger, horizon=7, ignore_start_bomb=True
             )
             if enemy_escape is None:
                 trap_score += 2.8
             else:
                 _, etime, e_safe = enemy_escape
-                enemy_area = self._reachable_count(
-                    ctx, e_safe, etime, hypo_bombs, hypo_danger, 5
-                )
+                enemy_area = self._reachable_count(ctx, e_safe, etime, hypo_bombs, hypo_danger, 5)
                 if enemy_area <= 2:
                     trap_score += 1.4
                 elif enemy_area <= 5:
@@ -755,9 +733,7 @@ class Agent:
         if ctx["phase"] == "end" and enemy_hits:
             det_time = self._hypothetical_det_time(hypo_bombs, pos)
             for enemy in enemy_hits:
-                profile = self._enemy_escape_profile(
-                    ctx, enemy["pos"], hypo_bombs, hypo_danger, min(det_time + 1, 8)
-                )
+                profile = self._enemy_escape_profile(ctx, enemy["pos"], hypo_bombs, hypo_danger, min(det_time + 1, 8))
                 deadness = self._dead_zone_score(ctx, enemy["pos"])
                 if profile["routes"] <= 1:
                     endgame_trap_bonus += 3.0
@@ -776,52 +752,44 @@ class Agent:
         item_value = boxes * 0.9
         multi_bonus = max(0, boxes - 1) * 1.2
         score = boxes * 3.0 + multi_bonus + item_value
-        score += len(enemy_hits) * 6.5 + trap_score * 3.0
         score += endgame_trap_bonus
-        tempo = ctx["tempo"]
-        if tempo == "economy":
-            score += min(boxes, 3) * 0.7
-            if enemy_hits and trap_score < 1.8:
-                score -= 1.6
-        elif tempo == "box_farm":
-            score += boxes * 1.7 + max(0, boxes - 2) * 0.8
-            if boxes == 0 and not enemy_hits:
-                score -= 2.0
-        elif tempo == "item_race":
-            score -= 0.6
-            if boxes:
-                score += min(boxes, 2) * 0.2
-            if enemy_hits:
-                score += 0.5
-        elif tempo == "hunt":
-            score += len(enemy_hits) * 3.2 + trap_score * 1.8
-            if boxes and not enemy_hits:
-                score -= 1.8
+        
+        mode = ctx.get("mode", "economy")
+        aggression = ctx.get("aggression", 0.5)
+
+        if mode == "escape":
+            score -= 10.0
+        elif mode == "unstuck":
+            score += boxes * 0.9 + min(escape_area, 10) * 0.08
+        else:
+            enemy_weight = 0.5 + aggression * 2.7
+            trap_weight = 0.1 + aggression * 1.7
+            score += len(enemy_hits) * enemy_weight + trap_score * trap_weight
+
             target_id = ctx.get("target_enemy_id")
             if target_id is not None:
                 target_hits = [enemy for enemy in enemy_hits if enemy["id"] == target_id]
                 if target_hits:
-                    score += 4.0
-        elif tempo == "unstuck":
-            score += boxes * 0.9 + min(escape_area, 10) * 0.08
-        elif tempo in ("pressure", "tiebreak"):
-            score += len(enemy_hits) * 0.9 + trap_score * 0.45
-            if boxes and not enemy_hits:
-                score -= 0.25
-        elif tempo == "duel":
-            score += len(enemy_hits) * 1.4 + trap_score * 0.75
-            if boxes and not enemy_hits:
-                score -= 1.2
-        elif tempo == "survive_duel":
-            score += len(enemy_hits) * 1.2 + trap_score * 0.6
-            if escape_area <= 6:
-                score -= 1.2
-        elif tempo == "escape":
-            score -= 10.0
+                    score += aggression * 4.0
+
+            if mode == "economy":
+                box_bonus = max(0.0, 1.7 - aggression * 4.0) 
+                score += boxes * box_bonus
+                if boxes == 0 and not enemy_hits:
+                    score -= 1.0 + (1.0 - aggression)
+                if enemy_hits and trap_score < 1.8:
+                    score -= 1.6
+            elif mode == "combat":
+                if boxes and not enemy_hits:
+                    score -= 0.25 + aggression * 1.55
+                if escape_area <= 6 and aggression < 0.6:
+                    score -= 1.2
+
         if ctx["phase"] == "end" and boxes and not enemy_hits:
             score -= 2.0
-        if ctx["engagement_deficit"] and boxes:
+        if ctx.get("engagement_deficit") and boxes:
             score += min(ctx["engagement_deficit"], 4) * 0.35
+            
         score += min(escape_area, 12) * 0.12
         if slack < 3:
             score -= (3 - slack) * 1.6
@@ -838,11 +806,11 @@ class Agent:
             "boxes": boxes,
             "enemy_hits": len(enemy_hits),
             "trap_score": trap_score,
-            "phase": ctx["phase"],
-            "tempo": ctx["tempo"],
             "slack": slack,
             "escape_area": escape_area,
-            "escape_action": escape_action,
+            "phase": ctx["phase"],
+            "mode": mode,
+            "aggression": aggression,
         }
 
     def _illegal_bomb_score(self):
@@ -964,19 +932,27 @@ class Agent:
         return best
 
     def _item_value(self, ctx, cell):
-        if ctx["tempo"] == "item_race":
-            return 10.5 if cell == self.ITEM_CAPACITY else 9.8
-        if ctx["tempo"] == "escape":
-            return 2.5 if cell == self.ITEM_CAPACITY else 2.0
-        if cell == self.ITEM_CAPACITY:
-            if ctx["my_bombs_left"] <= 1:
-                return 8.0 if ctx["tempo"] == "economy" else 6.2 if ctx["phase"] == "end" else 7.0
-            return 5.0 if ctx["tempo"] == "economy" else 3.6 if ctx["phase"] == "end" else 4.0
+        mode = ctx.get("mode", "economy")
+        aggression = ctx.get("aggression", 0.5)
+
+        if mode == "escape":
+            return 0.0
+
+        base = 8.0 - aggression * 3.0 if mode == "economy" else 6.0 - aggression * 4.0
+        
+        my_rad = ctx["my_radius"]
+        my_bombs = ctx["my_bombs_left"]
+
         if cell == self.ITEM_RADIUS:
-            if ctx["my_bonus"] <= 1:
-                return 7.8 if ctx["tempo"] == "economy" else 5.8 if ctx["phase"] == "end" else 6.5
-            if ctx["my_bonus"] < self.MAX_RADIUS - 1:
-                return 4.2 if ctx["tempo"] == "economy" else 3.0 if ctx["phase"] == "end" else 3.5
+            if my_rad >= self.MAX_RADIUS:
+                return 0.0
+            return base * (1.2 if my_rad < 3 else 1.0)
+        elif cell == self.ITEM_CAPACITY:
+            max_b = ctx["max_bombs_left_seen"]
+            if my_bombs >= self.MAX_BOMBS:
+                return 0.0
+            bonus = 1.5 if my_bombs == 1 else (1.2 if my_bombs < max_b else 1.0)
+            return base * bonus
         return 0.0
 
     def _best_box_position_move(self, ctx, reach):
@@ -995,15 +971,15 @@ class Agent:
                     continue
                 open_n = self._open_neighbors(grid, pos, ctx["bomb_positions"])
                 value = boxes * 3.0 + max(0, boxes - 1) * 1.3 + open_n * 0.25
-                if ctx["tempo"] in ("economy", "unstuck", "box_farm"):
+                if ctx["mode"] in ("economy", "unstuck", "box_farm"):
                     value += boxes * 0.9
-                    if ctx["tempo"] == "box_farm":
+                    if ctx["mode"] == "box_farm":
                         value += boxes * 1.4 + max(0, boxes - 2) * 1.2
-                elif ctx["tempo"] in ("duel", "survive_duel"):
+                elif ctx["mode"] in ("duel", "survive_duel"):
                     value *= 0.45
-                elif ctx["tempo"] in ("pressure", "tiebreak", "hunt"):
+                elif ctx["mode"] in ("pressure", "tiebreak", "hunt"):
                     value *= 0.75
-                elif ctx["tempo"] in ("escape", "item_race"):
+                elif ctx["mode"] in ("escape", "item_race"):
                     value *= 0.35
                 candidates.append((value, pos, boxes))
 
@@ -1020,8 +996,16 @@ class Agent:
             if boxes >= 2:
                 score += 0.6
             if best is None or score > best[0]:
-                best = (score, action)
-        return best
+                best = (score, pos, action)
+        
+        if best is not None:
+            best_score, best_pos, best_action = best
+            b_score = self._score_bomb_at(ctx, best_pos)
+            if b_score["legal"] and b_score["score"] > self._bomb_threshold(b_score):
+                if best_pos == ctx["my_pos"]:
+                    return (best_score, self.BOMB)
+                return (best_score, best_action)
+        return None
 
     def _best_enemy_pressure_move(self, ctx, reach):
         if ctx["my_bombs_left"] <= 0 or not ctx["enemies"]:
@@ -1030,7 +1014,7 @@ class Agent:
         candidates = []
         target_enemy_id = ctx.get("target_enemy_id")
         for enemy in ctx["enemies"]:
-            if target_enemy_id is not None and enemy["id"] != target_enemy_id and ctx["tempo"] == "hunt":
+            if target_enemy_id is not None and enemy["id"] != target_enemy_id and ctx["mode"] == "hunt":
                 continue
             epos = enemy["pos"]
             for x in range(1, grid.shape[0] - 1):
@@ -1046,15 +1030,15 @@ class Agent:
                         value = 2.0 - self._manhattan(pos, epos) * 0.25
                     else:
                         continue
-                    if ctx["tempo"] in ("pressure", "tiebreak"):
+                    if ctx["mode"] in ("pressure", "tiebreak"):
                         value += 0.7
-                    elif ctx["tempo"] == "duel":
+                    elif ctx["mode"] == "duel":
                         value += 1.2
-                    elif ctx["tempo"] == "survive_duel":
+                    elif ctx["mode"] == "survive_duel":
                         value += 0.7
-                    elif ctx["tempo"] == "economy":
+                    elif ctx["mode"] == "economy":
                         value -= 1.5
-                    elif ctx["tempo"] == "hunt":
+                    elif ctx["mode"] == "hunt":
                         value += 2.6
                         if target_enemy_id == enemy["id"]:
                             value += 2.2 + enemy["stats"].get("kills", 0) * 0.8
@@ -1071,8 +1055,16 @@ class Agent:
             if pos in ctx["enemy_risk"]:
                 score -= 0.9
             if best is None or score > best[0]:
-                best = (score, action)
-        return best
+                best = (score, pos, action)
+        
+        if best is not None:
+            best_score, best_pos, best_action = best
+            b_score = self._score_bomb_at(ctx, best_pos)
+            if b_score["legal"] and b_score["score"] > self._bomb_threshold(b_score):
+                if best_pos == ctx["my_pos"]:
+                    return (best_score, self.BOMB)
+                return (best_score, best_action)
+        return None
 
     def _best_chase_space_move(self, ctx, reach):
         if not ctx["enemies"]:
@@ -1092,23 +1084,23 @@ class Agent:
             if pos in ctx["bomb_positions"] or pos in ctx["enemy_risk"]:
                 continue
             nearest_enemy_dist = min(self._manhattan(pos, e["pos"]) for e in targets)
-            if nearest_enemy_dist > 6 and ctx["tempo"] not in ("tiebreak", "hunt"):
+            if nearest_enemy_dist > 6 and ctx["mode"] not in ("tiebreak", "hunt"):
                 continue
             score = 3.2 - nearest_enemy_dist * 0.38 - dist * 0.18
             score += self._open_neighbors(grid, pos, ctx["bomb_positions"]) * 0.25
             score -= self._manhattan(pos, center) * 0.05
-            if ctx["tempo"] == "duel":
+            if ctx["mode"] == "duel":
                 score += 1.0
-            elif ctx["tempo"] == "survive_duel":
+            elif ctx["mode"] == "survive_duel":
                 score += min(
                     self._reachable_count(ctx, pos, dist, ctx["bombs"], ctx["danger_at"], 6),
                     12,
                 ) * 0.08
                 score -= max(0, 3 - nearest_enemy_dist) * 0.4
-            elif ctx["tempo"] == "tiebreak":
+            elif ctx["mode"] == "tiebreak":
                 score += max(0, 5 - nearest_enemy_dist) * 0.25
                 score += min(ctx["engagement_deficit"], 5) * 0.18
-            elif ctx["tempo"] == "hunt":
+            elif ctx["mode"] == "hunt":
                 score += 2.8 + max(0, 6 - nearest_enemy_dist) * 0.45
                 score -= dist * 0.1
             if best is None or score > best[0]:
@@ -1165,7 +1157,7 @@ class Agent:
                 score += 18.0
             else:
                 escape = self._find_escape(
-                    ctx["grid"], npos, 1, ctx["bombs"], ctx["danger_at"], self.HORIZON
+                    ctx["grid"], npos, 1, ctx["bombs"], ctx["danger_at"], self.HORIZON, enemies=ctx.get("enemies")
                 )
                 if escape is None:
                     score -= 30.0
@@ -1261,34 +1253,51 @@ class Agent:
         bombs,
         danger_at,
         horizon,
+        enemies=None,
         ignore_start_bomb=False,
     ):
-        q = deque([(start, start_time, None)])
-        seen = {(start, start_time)}
-        while q:
-            pos, t, first = q.popleft()
-            if t > start_time and self._is_future_safe(pos, t, danger_at):
-                return (first if first is not None else self.STOP, t, pos)
-            if t - start_time >= horizon:
-                continue
+        enemy_risk = set()
+        if enemies:
+            for e in enemies:
+                ex, ey = e["pos"] if isinstance(e, dict) else e
+                enemy_risk.add((ex, ey))
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    enemy_risk.add((ex + dx, ey + dy))
 
-            for action in self.SEARCH_ACTIONS:
-                npos = self._next_pos(pos, action)
-                nt = t + 1
-                if not self._passable(grid, npos[0], npos[1]):
+        def search(avoid_enemies):
+            q = deque([(start, start_time, None)])
+            seen = {(start, start_time)}
+            while q:
+                pos, t, first = q.popleft()
+                if t > start_time and self._is_future_safe(pos, t, danger_at):
+                    return (first if first is not None else self.STOP, t, pos)
+                if t - start_time >= horizon:
                     continue
-                if self._bomb_blocks(pos, npos, nt, bombs):
-                    if not (ignore_start_bomb and npos == start):
+
+                for action in self.SEARCH_ACTIONS:
+                    npos = self._next_pos(pos, action)
+                    nt = t + 1
+                    if not self._passable(grid, npos[0], npos[1]):
                         continue
-                if self._is_deadly(npos, nt, danger_at):
-                    continue
-                state = (npos, nt)
-                if state in seen:
-                    continue
-                seen.add(state)
-                first_action = action if first is None else first
-                q.append((npos, nt, first_action))
-        return None
+                    if self._bomb_blocks(pos, npos, nt, bombs):
+                        if not (ignore_start_bomb and npos == start):
+                            continue
+                    if self._is_deadly(npos, nt, danger_at):
+                        continue
+                    if avoid_enemies and npos in enemy_risk and npos != start:
+                        continue
+                    state = (npos, nt)
+                    if state in seen:
+                        continue
+                    seen.add(state)
+                    first_action = action if first is None else first
+                    q.append((npos, nt, first_action))
+            return None
+
+        res = search(avoid_enemies=True) if enemies else None
+        if res is not None:
+            return res
+        return search(avoid_enemies=False)
 
     def _reachable_count(self, ctx, start, start_time, bombs, danger_at, horizon):
         grid = ctx["grid"]
@@ -1601,7 +1610,7 @@ class Agent:
         score = -len(enemies) * 10000 
         
         # Space evaluation
-        escape = self._find_escape(grid, my_pos, 0, [], danger_at, 10)
+        escape = self._find_escape(grid, my_pos, 0, [], danger_at, 10, enemies=enemies)
         e_space = 10 if escape is not None else 0
         if e_space == 0: score -= 50000
         else: score += e_space * 10
