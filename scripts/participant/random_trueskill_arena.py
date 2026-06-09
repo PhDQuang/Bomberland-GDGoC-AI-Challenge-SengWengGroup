@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import csv
 import json
 import random
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import trueskill
 
-parent_dir = Path(__file__).resolve().parent.parent
+parent_dir = Path(__file__).resolve().parent.parent.parent
 if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
 
@@ -16,13 +17,25 @@ from scripts.participant.run_local_match import make_agents
 
 
 DEFAULT_AGENTS = [
-    "agentsangv4.py",
-    "agentpromax_v1.py",
+    "agent_adaptive_champion_v1.py",
     "agent_adaptive_pro_v1.py",
-    "agent_phase_v1.py",
-    "agent_temporal_hybrid_v1.py",
+    "agent_adaptive_pro_v2.py",
+    "agent_aggressive_endgame_v1.py",
+    "agent_balanced_killer_v1.py",
+    "agent_data_optimized_v1.py",
     "agent_economy_v1.py",
-    "TacticalRuleAgent",
+    "agent_killer.py",
+    "agent_metric_optimized_v1.py",
+    "agent_phase_v1.py",
+    "agent_ppo_v1.py",
+    "agent_replay_bc_v1.py",
+    "agent_skynet_prune_v1.py",
+    "agent_temporal_hybrid_v1.py",
+    "agent_ultimate_heuristic_v2.py",
+    "agent_ultimate_heuristic_v3.py",
+    "agentEnemy1.py",
+    "agentpromax_v1.py",
+    "agentsangv4.py"
 ]
 
 WIN_REASON_KEYS = ("survival", "kills", "boxes", "items", "bombs")
@@ -196,6 +209,13 @@ def run_one_match(agent_specs, seed, max_steps):
     }
 
 
+def run_indexed_match(job):
+    match_idx, agent_specs, seed, max_steps = job
+    result = run_one_match(agent_specs, seed, max_steps)
+    result["match_idx"] = match_idx
+    return result
+
+
 def update_table(table, ratings, ts_env, match_result, recency_by_name):
     names = match_result["names"]
     ranks = match_result["ranks"]
@@ -211,8 +231,15 @@ def update_table(table, ratings, ts_env, match_result, recency_by_name):
         row["games"] += 1
         row["wins"] += 1 if slot in winners and len(winners) == 1 else 0
         row["draws"] += 1 if slot in winners and len(winners) > 1 else 0
-        row["losses"] += 1 if slot not in winners else 0
-        row["deaths"] += 1 if match_result["death_steps"][slot] is not None else 0
+        is_loser = slot not in winners
+        row["losses"] += 1 if is_loser else 0
+        is_dead = match_result["death_steps"][slot] is not None
+        row["deaths"] += 1 if is_dead else 0
+        if is_loser:
+            if is_dead:
+                row["loss_by_death"] += 1
+            else:
+                row["loss_by_tie"] += 1
         row["total_rank"] += int(ranks[slot])
         row["total_steps"] += int(match_result["survival_steps"][slot])
         row["action_errors"] += int(match_result["action_errors"][slot])
@@ -240,6 +267,8 @@ def leaderboard_rows(table, ratings):
                 "wins": row["wins"],
                 "draws": row["draws"],
                 "losses": row["losses"],
+                "loss_by_death": row["loss_by_death"],
+                "loss_by_tie": row["loss_by_tie"],
                 "deaths": row["deaths"],
                 "win_rate": row["wins"] / games,
                 "avg_rank": row["total_rank"] / games,
@@ -270,7 +299,7 @@ def leaderboard_rows(table, ratings):
 def print_leaderboard(rows):
     header = (
         "rank name                         score      mu   sigma games  W  D  L "
-        "death avgR  win% kills boxes items bombs surv% kill% box% item% bomb%"
+        "Ldie Ltie avgR  win% kills boxes items bombs surv% kill% box% item% bomb%"
     )
     print(header)
     print("-" * len(header))
@@ -279,7 +308,7 @@ def print_leaderboard(rows):
             f"{i:>4} {row['name'][:28]:<28} "
             f"{row['score']:>7.2f} {row['mu']:>7.2f} {row['sigma']:>6.2f} "
             f"{row['games']:>5} {row['wins']:>2} {row['draws']:>2} {row['losses']:>2} "
-            f"{row['deaths']:>5} {row['avg_rank']:>4.2f} {row['win_rate'] * 100:>5.1f} "
+            f"{row['loss_by_death']:>4} {row['loss_by_tie']:>4} {row['avg_rank']:>4.2f} {row['win_rate'] * 100:>5.1f} "
             f"{row['kills']:>5} {row['boxes']:>5} {row['items']:>5} {row['bombs']:>5} "
             f"{row['win_survival_pct'] * 100:>5.1f} {row['win_kills_pct'] * 100:>5.1f} "
             f"{row['win_boxes_pct'] * 100:>4.1f} {row['win_items_pct'] * 100:>5.1f} "
@@ -306,6 +335,18 @@ def main():
     parser.add_argument("--matches", type=int, default=300)
     parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=20260528)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for parallel match simulation. TrueSkill is updated in the main process as results finish.",
+    )
+    parser.add_argument(
+        "--parallel_backend",
+        choices=["process", "thread"],
+        default="process",
+        help="Parallel backend. Use process for speed; use thread if multiprocessing is blocked on your machine.",
+    )
     parser.add_argument("--progress_every", type=int, default=25)
     parser.add_argument("--csv", default="logs/arena/random_trueskill_leaderboard.csv")
     parser.add_argument("--json", default="logs/arena/random_trueskill_matches.json")
@@ -343,24 +384,48 @@ def main():
             "win_by_boxes": 0,
             "win_by_items": 0,
             "win_by_bombs": 0,
+            "loss_by_death": 0,
+            "loss_by_tie": 0,
             "action_errors": 0,
             "invalid_actions": 0,
             "recency": idx,
         }
 
-    matches = []
+    match_jobs = []
     for match_idx in range(args.matches):
         chosen_specs = rng.sample(agent_specs, 4)
         rng.shuffle(chosen_specs)
         match_seed = rng.randrange(1, 2**31 - 1)
-        result = run_one_match(chosen_specs, match_seed, args.max_steps)
+        match_jobs.append((match_idx, chosen_specs, match_seed, args.max_steps))
+
+    matches = []
+    completed = 0
+
+    def consume_result(result):
+        nonlocal completed
         matches.append(result)
         update_table(table, ratings, ts_env, result, recency_by_name)
+        completed += 1
 
-        if args.progress_every and (match_idx + 1) % args.progress_every == 0:
-            print(f"\nAfter {match_idx + 1}/{args.matches} matches")
+        if args.progress_every and completed % args.progress_every == 0:
+            print(f"\nAfter {completed}/{args.matches} matches")
             print_leaderboard(leaderboard_rows(table, ratings))
 
+    if args.workers <= 1:
+        for job in match_jobs:
+            consume_result(run_indexed_match(job))
+    else:
+        executor_cls = (
+            concurrent.futures.ThreadPoolExecutor
+            if args.parallel_backend == "thread"
+            else concurrent.futures.ProcessPoolExecutor
+        )
+        with executor_cls(max_workers=args.workers) as executor:
+            futures = [executor.submit(run_indexed_match, job) for job in match_jobs]
+            for future in concurrent.futures.as_completed(futures):
+                consume_result(future.result())
+
+    matches.sort(key=lambda item: item.get("match_idx", 0))
     rows = leaderboard_rows(table, ratings)
     print("\nFinal leaderboard")
     print_leaderboard(rows)
